@@ -686,6 +686,64 @@ mod test {
     }
 
     #[tokio::test]
+    async fn configured_trust_domains_do_not_trust_another_root() {
+        helpers::initialize_telemetry();
+        let server_id = Identity::from_str("spiffe://td/ns/n/sa/a").unwrap();
+        let client_id = Identity::from_str("spiffe://other-td/ns/n/sa/b").unwrap();
+        let certs = |id: &Identity, key: &[u8], roots: Vec<&[u8]>| {
+            let (key, cert) = crate::tls::mock::generate_test_certs_with_root(
+                &TestIdentity::Identity(id.clone()),
+                SystemTime::now(),
+                SystemTime::now() + Duration::from_secs(60),
+                None,
+                key,
+            );
+            WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), roots).unwrap()
+        };
+        let server_cert = certs(&server_id, TEST_ROOT_KEY, vec![TEST_ROOT]);
+        // The client trusts the server's root, but its own certificate chains to a
+        // different root which the server has never been given.
+        let mut client_roots = TEST_ROOT.to_vec();
+        client_roots.push(b'\n');
+        client_roots.extend(TEST_ROOT2);
+        let client_cert = certs(&client_id, TEST_ROOT2_KEY, vec![&client_roots]);
+        for accepted in ["other-td", "*"] {
+            let mgr =
+                crate::tls::trust_domains::TrustDomainManager::from_trust_domains(&[accepted]);
+            let server = server_cert.server_config(Some(&mgr), None).unwrap();
+            let tls = TlsAcceptor::from(Arc::new(server));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                tls.accept(stream).await.unwrap_err()
+            });
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client = client_cert
+                .outbound_connector(vec![server_id.clone()], None)
+                .unwrap();
+            if let Ok(mut tls) = client.connect(stream).await {
+                let _ = tls.write(b"hi").await;
+                let mut buf = [0u8; 4];
+                assert!(tls.read_exact(&mut buf).await.is_err());
+            }
+            let err = server.await.unwrap();
+            assert!(
+                matches!(
+                    err.get_ref()
+                        .and_then(|e| e.downcast_ref::<rustls::Error>()),
+                    Some(rustls::Error::InvalidCertificate(
+                        // The two test roots share an issuer name but have different
+                        // keys, so the untrusted signer fails signature validation.
+                        rustls::CertificateError::BadSignature
+                    ))
+                ),
+                "accepted domain {accepted} must not add a trusted root: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn configured_trust_domains() {
         helpers::initialize_telemetry();
         let server_id = Identity::from_str("spiffe://td/ns/n/sa/a").unwrap();

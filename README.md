@@ -19,6 +19,19 @@ If a feature is not directly used to implement the node proxy component in ambie
 
 The details of architecture is [here](./ARCHITECTURE.md).
 
+### Trust domains and certificate roots
+
+`TRUST_DOMAINS_PATH` reloads the accepted peer domains published by istiod. It
+changes domain validation, not the certificate roots ztunnel trusts. Explicit
+`caCertificates[].trustDomains` can therefore admit another domain only when its
+peer certificate chains to an already trusted root. This does not add PCDS or
+distribution of the additional roots from `ISTIO_MULTIROOT_MESH`.
+Native CA responses can already supply concatenated root bundles; this backport
+does not change their contents or delivery. Keep separate
+production, nonproduction and build root boundaries; domain acceptance alone
+cannot bridge them. Deployments using this backport should leave
+`trustDomainAliases` unused and `PILOT_SKIP_VALIDATE_TRUST_DOMAIN` false.
+
 ## Building
 
 Please use the same Rust version as the [`build-tools`](https://github.com/istio/tools/tree/master/docker/build-tools) image.
