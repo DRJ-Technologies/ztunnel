@@ -106,6 +106,10 @@ impl PeerRoots {
         let roots = self.0.read().unwrap();
         f(&roots)
     }
+    #[cfg(test)]
+    pub(crate) fn write_blocked(&self) -> bool {
+        matches!(self.0.try_write(), Err(std::sync::TryLockError::WouldBlock))
+    }
 }
 
 impl TrustDomainManager {

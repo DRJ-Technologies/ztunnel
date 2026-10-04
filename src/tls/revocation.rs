@@ -120,8 +120,8 @@ impl RevocationHandle {
             .map_or_else(|| "<unknown>".to_string(), |id| id.to_string())
     }
 
-    /// Resolves only when a CRL update actually revokes a cert in this connection's chain.
-    /// CRL reloads that don't affect this chain are ignored, so connection is torn down strictly on revocation.
+    /// Resolves for a rejected final registration or a native CRL proof of revocation.
+    /// An accepted registration always retains its leaf for later per-connection rechecks.
     pub async fn revoked(&mut self) {
         // The index's navigation sends the signal (after recording the metric); just await it
         loop {
@@ -396,16 +396,28 @@ impl RevocationIndex {
                             drop_revoked(&self.metrics, conn.reporter, &tx);
                             None
                         }
-                        // handshake already verified this chain, so a failure here is
-                        // likely the result of a race between state updates and verifyForUse calls
+                        // A foreign, same-name issuer CRL can cause a native signature error
+                        // after TLS admission. Preserve the independently trusted leaf in the
+                        // index so a later valid issuer CRL can still revoke it.
                         Err(e) => {
-                            warn!(
-                                peer = conn.peer(),
-                                error = %e,
-                                "crl index: re-verification failed; connection not tracked"
-                            );
-                            self.metrics.record_crl_untracked_connection(conn.reporter);
-                            None
+                            warn!(peer = conn.peer(), error = %e,
+                                "crl re-verification failed; retaining only a current-root-qualified chain");
+                            match verify_cert_chain(leaf, presented_ias, roots, conn.established, conn.key_usage, &[]) {
+                                Ok(verified) => {
+                                    let mut chain = Vec::with_capacity(verified.intermediates.len() + 1);
+                                    chain.push(leaf.clone());
+                                    chain.extend(verified.intermediates);
+                                    self.inner.write().unwrap().insert(&conn, &chain, tx.clone(), &self.metrics)
+                                }
+                                Err(error) => {
+                                    warn!(peer = conn.peer(), error = %error,
+                                        "current roots no longer verify new connection registration");
+                                    self.metrics.record_crl_untracked_connection(conn.reporter);
+                                    // A rejected registration cannot leave an accepted, untracked tunnel.
+                                    let _ = tx.send(true);
+                                    None
+                                }
+                            }
                         }
                     }
                 }
@@ -430,6 +442,19 @@ impl RevocationIndex {
 
             tracked
         });
+
+        if tracked.is_none() {
+            // Final registration either owns a leaf for future native rechecks or rejects the
+            // new tunnel. Never return a live, permanently untracked connection on any error.
+            let _ = tx.send_if_modified(|rejected| {
+                if *rejected {
+                    false
+                } else {
+                    *rejected = true;
+                    true
+                }
+            });
+        }
 
         RevocationHandle {
             revoked_rx: rx,
@@ -2100,26 +2125,17 @@ mod tests {
                 map.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
                 map.write_all(&bundle_map(&[("a", vec![b_pem.as_bytes()])]))
                     .unwrap();
-                let (started_tx, started_rx) = mpsc::sync_channel(1);
-                let (done_tx, done_rx) = mpsc::sync_channel(1);
+                // Check the actual publication lock nonblockingly while the native navigation
+                // hook holds its read guard. This does not depend on the writer being scheduled.
+                let blocked = selected.roots.write_blocked();
                 let rotating = manager.clone();
-                let update = std::thread::spawn(move || {
-                    started_tx.send(()).unwrap();
-                    let result = rotating.reload();
-                    done_tx.send(()).unwrap();
-                    result
-                });
-                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                let blocked = matches!(
-                    done_rx.recv_timeout(Duration::from_millis(100)),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                );
+                let update = std::thread::spawn(move || rotating.reload());
                 release_tx.send(()).unwrap();
                 nav.join().unwrap();
                 update.join().unwrap().unwrap();
                 assert!(
                     blocked,
-                    "root publication must wait until crypto and signal release the current-store guard"
+                    "the selected-store write boundary must be blocked through crypto and signal"
                 );
                 assert_eq!(
                     *tracked.subscribe_revoked().borrow(),
@@ -2132,6 +2148,57 @@ mod tests {
                     "B update must independently enforce its already-loaded CRL"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mapped_registration_foreign_crl_error_retains_leaf_for_own_revocation() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        let root_a = gen_ca("same-root", 1);
+        let root_b = gen_ca("same-root", 1);
+        let b_pem = root_b.1.self_signed(&root_b.0).unwrap().pem();
+        let id = Identity::from_str("spiffe://b/ns/n/sa/b").unwrap();
+        let chain = vec![signed_by(&gen_leaf(&id.to_string(), 99), &root_b)];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            let (mut crl_file, crls) = crl_manager_empty();
+            let manager =
+                TrustDomainManager::from_bundle_map(&bundle_map(&[("b", vec![b_pem.as_bytes()])]))
+                    .unwrap();
+            let selected =
+                manager.register_with_crls(id.clone(), chain.clone(), usage, Some(crls.clone()));
+            assert!(!*selected.subscribe().borrow());
+            // CRL publication races between mapped admission and native CRL registration.
+            write_crl(&mut crl_file, &crl_pem_signed(&root_a, 1, &[99]));
+            crls.load_crl().unwrap();
+            let error = verify_cert_chain(
+                &chain[0],
+                &chain[1..],
+                &selected.roots.current(),
+                UnixTime::now(),
+                usage,
+                &crls.get_crls(),
+            )
+            .err()
+            .expect("foreign same-DN signature must fail native CRL verification");
+            assert!(
+                !matches!(error, webpki::Error::CertRevoked),
+                "an unrelated issuer cannot prove B revoked"
+            );
+            let mut reg = conn_reg(chain.clone(), selected.roots.current())
+                .with_peer_roots(selected.roots.clone());
+            reg.key_usage = usage;
+            let tracked = crls.register(reg);
+            assert!(
+                !*tracked.subscribe_revoked().borrow(),
+                "unrelated CRL must preserve trusted B"
+            );
+            write_crl(&mut crl_file, &crl_pem_signed(&root_b, 2, &[99]));
+            crls.load_crl().unwrap();
+            assert!(
+                *tracked.subscribe_revoked().borrow(),
+                "B's later valid CRL must find the retained leaf"
+            );
         }
     }
 }
