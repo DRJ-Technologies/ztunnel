@@ -85,6 +85,7 @@ impl Outbound {
             self.pi.socket_factory.clone(),
             self.pi.local_workload_information.clone(),
             self.pi.crl_manager.clone(),
+            self.pi.trust_domain_manager.clone(),
             self.pi.metrics.clone(),
         );
         let pi = self.pi.clone();
@@ -277,8 +278,11 @@ impl OutboundConnection {
                 .local_workload_information
                 .fetch_certificate()
                 .await?;
-            let connector =
-                cert.outbound_connector(wl_key.dst_id.clone(), self.pi.crl_manager.clone())?;
+            let connector = cert.outbound_connector_with_trust_domains(
+                wl_key.dst_id.clone(),
+                self.pi.crl_manager.clone(),
+                self.pi.trust_domain_manager.as_ref(),
+            )?;
             let tls_stream = connector.connect(upgraded).await.inspect_err(|e| {
                 if crate::tls::io_error_is_cert_revoked(e) {
                     self.pi
@@ -292,17 +296,27 @@ impl OutboundConnection {
                 tls::identity(&x509_cert)
             };
 
-            // Spawn inner CONNECT tunnel
+            let peer = peer_identity
+                .clone()
+                .ok_or(Error::ConnectionTrackingFailed)?;
+            let trust_domain = cert.register_peer(
+                self.pi.trust_domain_manager.as_ref(),
+                ssl,
+                peer.clone(),
+                webpki::KeyUsage::server_auth(),
+            )?;
             let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
-            // Enforce CRL revocation on this inner tunnel for its lifetime
             let revocation = self.pi.crl_manager.as_ref().map(|crl_manager| {
-                crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
-                    ssl,
-                    peer_identity.clone(),
-                    cert.root_store(),
-                    webpki::KeyUsage::server_auth(),
-                    crate::proxy::metrics::Reporter::source,
-                ))
+                crl_manager.register(
+                    crate::tls::revocation::ConnRegistration::from_conn(
+                        ssl,
+                        Some(peer),
+                        trust_domain.roots.current(),
+                        webpki::KeyUsage::server_auth(),
+                        crate::proxy::metrics::Reporter::source,
+                    )
+                    .with_peer_roots(trust_domain.roots.clone()),
+                )
             });
             let mut sender = super::h2::client::spawn_connection(
                 self.pi.cfg.clone(),
@@ -310,6 +324,7 @@ impl OutboundConnection {
                 drain_rx,
                 wl_key,
                 revocation,
+                Some(trust_domain),
             )
             .await?;
             // The inner tunnel's revocation signal
@@ -943,6 +958,7 @@ mod tests {
                 cfg.clone(),
                 sock_fact,
                 local_workload_information.clone(),
+                None,
                 None,
                 test_proxy_metrics(),
             ),
@@ -2104,6 +2120,7 @@ mod tests {
                 cfg.clone(),
                 sock_fact,
                 local_workload_information.clone(),
+                None,
                 None,
                 test_proxy_metrics(),
             ),

@@ -21,7 +21,7 @@ use std::time::Instant;
 use tls_listener::AsyncTls;
 use tokio::sync::watch;
 
-use tracing::{Instrument, debug, error, info, info_span, trace_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace_span};
 
 use super::{
     ConnectionResult, ConnectionResultBuilder, Error, HboneAddress, LocalWorkloadInformation,
@@ -156,7 +156,7 @@ impl Inbound {
                         // Enforce CRL revocation on this existing connection when a CRL is configured,
                         // and close it if its peer's trust domain stops being accepted.
                         let (revocation, trust_domain) =
-                            Box::pin(Self::track_connection(&pi, ssl, src_identity)).await;
+                            Box::pin(Self::track_connection(&pi, ssl, src_identity)).await?;
                         let revoked_rx = revocation.as_ref().map(|r| r.subscribe_revoked());
                         let trust_domain_rx = trust_domain.as_ref().map(|t| t.subscribe());
                         let request_handler = move |req| {
@@ -207,72 +207,40 @@ impl Inbound {
         .await
     }
 
-    /// Builds this connection's CRL revocation state, or `None` when CRL enforcement is disabled.
-    /// Kept as its own `async fn` (and boxed at the call site) so the `fetch_certificate` await
-    /// doesn't grow the size of the caller's future.
-    async fn build_revocation(
-        pi: &ProxyInputs,
-        ssl: &CommonState,
-        peer_identity: Option<Identity>,
-    ) -> Option<crate::tls::revocation::RevocationHandle> {
-        let crl_manager = pi.crl_manager.as_ref()?;
-        match pi.local_workload_information.fetch_certificate().await {
-            Ok(cert) => Some(crl_manager.register(
-                crate::tls::revocation::ConnRegistration::from_conn(
-                    ssl,
-                    peer_identity,
-                    cert.root_store(),
-                    webpki::KeyUsage::client_auth(),
-                    crate::proxy::metrics::Reporter::destination,
-                ),
-            )),
-            Err(e) => {
-                warn!("failed to fetch certificate for CRL revocation enforcement: {e}");
-                pi.metrics
-                    .record_crl_untracked_connection(crate::proxy::metrics::Reporter::destination);
-                None
-            }
-        }
-    }
-
-    /// Builds the state that can close this connection after it was accepted: CRL revocation and removal
-    /// of the peer's trust domain from the accepted set. Both are async and held for the connection's
-    /// lifetime, so they are built together to keep the caller's future small.
+    /// Finish registration against the current selected bundle under its update lock before h2 can
+    /// accept requests. CRL tracking shares that selected store through later rotations.
     async fn track_connection(
         pi: &ProxyInputs,
         ssl: &CommonState,
         peer_identity: Option<Identity>,
-    ) -> (
-        Option<crate::tls::revocation::RevocationHandle>,
-        Option<crate::tls::trust_domains::TrustDomainHandle>,
-    ) {
-        let trust_domain = Self::track_trust_domain(pi, peer_identity.as_ref()).await;
-        let revocation = Self::build_revocation(pi, ssl, peer_identity).await;
-        (revocation, trust_domain)
-    }
-
-    /// Registers this connection's peer trust domain for tracking, or `None` when there is nothing to
-    /// track: no trust domains are configured, or the peer is in our own trust domain, which is always
-    /// accepted.
-    async fn track_trust_domain(
-        pi: &ProxyInputs,
-        peer_identity: Option<&Identity>,
-    ) -> Option<crate::tls::trust_domains::TrustDomainHandle> {
-        let manager = pi.trust_domain_manager.as_ref()?;
-        let Identity::Spiffe {
-            trust_domain: peer_trust_domain,
-            ..
-        } = peer_identity?;
-        let own_trust_domain = match pi.local_workload_information.fetch_certificate().await {
-            Ok(cert) => cert.identity().map(|id| match id {
-                Identity::Spiffe { trust_domain, .. } => trust_domain,
-            }),
-            Err(e) => {
-                warn!("failed to fetch certificate for trust domain tracking: {e}");
-                None
-            }
-        };
-        manager.register(peer_trust_domain.clone(), own_trust_domain.as_ref())
+    ) -> Result<
+        (
+            Option<crate::tls::revocation::RevocationHandle>,
+            Option<crate::tls::trust_domains::TrustDomainHandle>,
+        ),
+        proxy::Error,
+    > {
+        let peer = peer_identity.ok_or(proxy::Error::ConnectionTrackingFailed)?;
+        let cert = pi.local_workload_information.fetch_certificate().await?;
+        let handle = cert.register_peer(
+            pi.trust_domain_manager.as_ref(),
+            ssl,
+            peer.clone(),
+            webpki::KeyUsage::client_auth(),
+        )?;
+        let revocation = pi.crl_manager.as_ref().map(|mgr| {
+            mgr.register(
+                crate::tls::revocation::ConnRegistration::from_conn(
+                    ssl,
+                    Some(peer),
+                    handle.roots.current(),
+                    webpki::KeyUsage::client_auth(),
+                    Reporter::destination,
+                )
+                .with_peer_roots(handle.roots.clone()),
+            )
+        });
+        Ok((revocation, Some(handle)))
     }
 
     fn extract_traceparent(req: &H2Request) -> TraceParent {

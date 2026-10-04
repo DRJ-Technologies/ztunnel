@@ -90,6 +90,7 @@ const HTTP2_FRAME_SIZE: &str = "HTTP2_FRAME_SIZE";
 const UNSTABLE_ENABLE_SOCKS5: &str = "UNSTABLE_ENABLE_SOCKS5";
 
 const CRL_PATH: &str = "CRL_PATH";
+const SPIFFE_BUNDLE_MAP_PATH: &str = "SPIFFE_BUNDLE_MAP_PATH";
 const TRUST_DOMAINS_PATH: &str = "TRUST_DOMAINS_PATH";
 
 const DEFAULT_WORKER_THREADS: u16 = 2;
@@ -337,9 +338,10 @@ pub struct Config {
 
     // path to CRL file; if set, enables CRL checking
     pub crl_path: Option<PathBuf>,
-    // path to the file listing trust domains accepted on inbound connections in addition to our own,
-    // one per line; reloaded on change
+    // Legacy names-file compatibility setting; never grants workload authority.
     pub trust_domains_path: Option<PathBuf>,
+    // Authoritative standard SPIFFE bundle map, reloaded through its parent directory.
+    pub spiffe_bundle_map_path: Option<PathBuf>,
     pub enable_enhanced_baggage: bool,
 }
 
@@ -956,6 +958,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from),
+        spiffe_bundle_map_path: env::var(SPIFFE_BUNDLE_MAP_PATH).ok().map(PathBuf::from),
         trust_domains_path: env::var(TRUST_DOMAINS_PATH)
             .ok()
             .filter(|s| !s.is_empty())

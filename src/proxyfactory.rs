@@ -88,16 +88,16 @@ impl ProxyFactory {
             None
         };
 
-        // Initialize the trust domain manager if trust_domains_path is set. Unlike the CRL, a missing
-        // or unreadable file is not fatal: we then accept only our own trust domain until it appears.
-        let trust_domain_manager = config.trust_domains_path.as_ref().map(|path| {
+        // Legacy names are compatibility data and never grant authority. Initial optional map
+        // absence is qualified local-only; errors after mapping disable authority.
+        let trust_domain_manager = config.spiffe_bundle_map_path.as_ref().map(|path| {
             let manager = tls::trust_domains::TrustDomainManager::new(path.clone());
             if let Err(e) = manager.start_file_watcher() {
+                manager.disable();
                 tracing::warn!(
                     path = ?path,
                     error = %e,
-                    "trust domains file watcher could not be started; \
-                    updates will require restarting ztunnel"
+                    "SPIFFE bundle map watcher could not be started; mapped authority disabled"
                 );
             }
             manager
