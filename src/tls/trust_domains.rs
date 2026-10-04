@@ -702,6 +702,43 @@ mod tests {
     }
 
     #[test]
+    fn initial_fallback_refuses_ambiguous_own_svid_uri() {
+        let ca = generate_ca_material("root", 1);
+        let id = Identity::from_str("spiffe://local/ns/n/sa/a").unwrap();
+        let own = generate_workload(&ca, &id.to_string());
+        let valid = TrustDomainManager::new(PathBuf::new());
+        valid.configure_local(&own).unwrap();
+        assert!(valid.selected(&id).is_ok());
+
+        for other in [
+            "spiffe://local/ns/n/sa/a",
+            "spiffe://foreign/ns/n/sa/a",
+            "https://example.test",
+        ] {
+            let (key, mut params) = crate::tls::mock::generate_leaf_material(&id.to_string(), 100);
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::URI(other.try_into().unwrap()));
+            let leaf = params
+                .signed_by(&key, &rcgen::Issuer::from_params(&ca.1, &ca.0))
+                .unwrap();
+            let root = ca.1.self_signed(&ca.0).unwrap().pem();
+            let own = WorkloadCertificate::new(
+                key.serialize_pem().as_bytes(),
+                leaf.pem().as_bytes(),
+                vec![root.as_bytes()],
+            )
+            .unwrap();
+            let manager = TrustDomainManager::new(PathBuf::new());
+            assert!(manager.configure_local(&own).is_err(), "{other}");
+            assert!(
+                manager.selected(&id).is_err(),
+                "ambiguous SVID cannot qualify startup authority"
+            );
+        }
+    }
+
+    #[test]
     fn startup_qualifies_only_own_svid_anchors_and_mapped_empty_never_falls_back() {
         let local = generate_ca_material("same-name", 1);
         let foreign = generate_ca_material("same-name", 1);

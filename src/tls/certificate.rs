@@ -119,21 +119,7 @@ impl Certificate {
     }
 
     pub fn identity(&self) -> Option<Identity> {
-        self.parsed()
-            .subject_alternative_name()
-            .ok()
-            .flatten()
-            .and_then(|ext| {
-                ext.value
-                    .general_names
-                    .iter()
-                    .filter_map(|n| match n {
-                        x509_parser::extensions::GeneralName::URI(uri) => Some(uri),
-                        _ => None,
-                    })
-                    .next()
-            })
-            .and_then(|san| Identity::from_str(san).ok())
+        identities(&self.parsed()).ok()?.into_iter().next()
     }
 
     #[cfg(test)]
