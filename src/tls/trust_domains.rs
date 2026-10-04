@@ -68,6 +68,8 @@ impl std::fmt::Debug for TrustDomainManager {
 }
 struct Inner {
     path: PathBuf,
+    // Serialize read/parse/publication, including the reconciliation after watcher attachment.
+    reload: Mutex<()>,
     snapshot: RwLock<Snapshot>,
     // Reload and final registration share this lock, preventing missed removal.
     conns: Mutex<Conns>,
@@ -85,6 +87,7 @@ struct Tracked {
     usage: KeyUsage,
     established: UnixTime,
     roots: PeerRoots,
+    crls: Option<Arc<crate::tls::crl::CrlManager>>,
     tx: watch::Sender<bool>,
 }
 
@@ -98,8 +101,10 @@ impl PeerRoots {
     pub fn current(&self) -> Arc<RootCertStore> {
         self.0.read().unwrap().clone()
     }
-    fn replace(&self, roots: Arc<RootCertStore>) {
-        *self.0.write().unwrap() = roots;
+    // Keep the selected store current through cryptographic verification and its teardown signal.
+    pub(crate) fn with_current<T>(&self, f: impl FnOnce(&RootCertStore) -> T) -> T {
+        let roots = self.0.read().unwrap();
+        f(&roots)
     }
 }
 
@@ -108,6 +113,7 @@ impl TrustDomainManager {
         let manager = Self {
             inner: Arc::new(Inner {
                 path,
+                reload: Mutex::new(()),
                 snapshot: RwLock::new(Snapshot::default()),
                 conns: Mutex::new(Conns::default()),
                 debouncer: Mutex::new(None),
@@ -185,6 +191,7 @@ impl TrustDomainManager {
     }
 
     pub fn disable(&self) {
+        let _reload = self.inner.reload.lock().unwrap();
         self.set(HashMap::new(), true);
     }
     pub fn generation(&self) -> u64 {
@@ -210,6 +217,7 @@ impl TrustDomainManager {
         }
     }
     pub fn reload(&self) -> Result<(), TrustDomainsError> {
+        let _reload = self.inner.reload.lock().unwrap();
         let next = std::fs::read(&self.inner.path)
             .map_err(TrustDomainsError::from)
             .and_then(|s| parse(&s));
@@ -248,6 +256,16 @@ impl TrustDomainManager {
         chain: Vec<CertificateDer<'static>>,
         usage: KeyUsage,
     ) -> TrustDomainHandle {
+        self.register_with_crls(peer, chain, usage, None)
+    }
+
+    pub fn register_with_crls(
+        &self,
+        peer: Identity,
+        chain: Vec<CertificateDer<'static>>,
+        usage: KeyUsage,
+        crls: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> TrustDomainHandle {
         let (tx, rx) = watch::channel(false);
         let mut conns = self.inner.conns.lock().unwrap();
         let selected = self.selected(&peer);
@@ -258,7 +276,10 @@ impl TrustDomainManager {
                 .map(|(_, r)| r.clone())
                 .unwrap_or_else(|_| Arc::new(RootCertStore::empty())),
         );
-        if selected.is_err() || verify_chain(&chain, &roots.current(), usage, now).is_err() {
+        let current_crls = crls.as_ref().map(|m| m.get_crls()).unwrap_or_default();
+        if selected.is_err()
+            || verify_chain(&chain, &roots.current(), usage, now, &current_crls).is_err()
+        {
             let _ = tx.send(true);
             return TrustDomainHandle {
                 rx,
@@ -278,6 +299,7 @@ impl TrustDomainManager {
                 usage,
                 established: now,
                 roots: roots.clone(),
+                crls,
                 tx,
             },
         );
@@ -327,19 +349,42 @@ impl TrustDomainManager {
         debouncer
             .watch(watch_path, RecursiveMode::NonRecursive)
             .map_err(|e| TrustDomainsError::WatchError(e.to_string()))?;
-        *self.inner.debouncer.lock().unwrap() = Some(debouncer);
-        Ok(())
+        let previous = self.inner.debouncer.lock().unwrap().replace(debouncer);
+        drop(previous);
+        // Events are subscribed before this read: changes between construction and attachment
+        // cannot leave the initial snapshot indefinitely authoritative.
+        match self.reload() {
+            Err(TrustDomainsError::IoError(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && !self.inner.snapshot.read().unwrap().authoritative =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 fn revalidate(conns: &mut Conns, snapshot: &Snapshot) {
     conns.entries.retain(|_, c| {
+        // CRL navigation holds the matching read lock through verification and signaling. A
+        // reload either precedes this update (and is checked here) or waits and checks new roots.
+        let mut current = c.roots.0.write().unwrap();
         let roots = snapshot.stores.get(&c.peer.trust_domain());
         let valid = !snapshot.failed
-            && roots.is_some_and(|r| verify_chain(&c.chain, r, c.usage, c.established).is_ok());
+            && roots.is_some_and(|r| {
+                verify_chain(&c.chain, r, c.usage, c.established, &[]).is_ok()
+                    // Preserve native active-connection CRL semantics: only cryptographically
+                    // proven CertRevoked triggers CRL teardown, not a foreign bad-signature CRL.
+                    && c.crls.as_ref().is_none_or(|m| {
+                        !crate::tls::revocation::chain_is_revoked(
+                            m, &c.chain, r, c.usage, c.established,
+                        )
+                    })
+            });
         if valid {
-            c.roots.replace(roots.unwrap().clone());
+            *current = roots.unwrap().clone();
         } else {
-            c.roots.replace(Arc::new(RootCertStore::empty()));
+            *current = Arc::new(RootCertStore::empty());
             let _ = c.tx.send(true);
         }
         valid
@@ -354,11 +399,12 @@ fn verify_chain(
     roots: &RootCertStore,
     usage: KeyUsage,
     now: UnixTime,
+    crls: &[webpki::CertRevocationList<'static>],
 ) -> Result<(), rustls::Error> {
     let Some((leaf, intermediates)) = chain.split_first() else {
         return Err(rejected());
     };
-    verify_cert_chain(leaf, intermediates, roots, now, usage, &[])
+    verify_cert_chain(leaf, intermediates, roots, now, usage, crls)
         .map(|_| ())
         .map_err(|_| rejected())
 }
@@ -633,6 +679,25 @@ mod tests {
     }
 
     #[test]
+    fn watcher_attachment_reconciles_projection_changed_after_initial_read() {
+        let ca = generate_ca_material("root", 1);
+        let pem = ca.1.self_signed(&ca.0).unwrap().pem();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spiffe-bundle-map.json");
+        std::fs::write(&path, bundle_map(&[("a", vec![pem.as_bytes()])])).unwrap();
+        let manager = TrustDomainManager::new(path.clone());
+        let id = Identity::from_str("spiffe://a/ns/n/sa/a").unwrap();
+        assert!(manager.selected(&id).is_ok());
+        // There is no subscriber yet, and no further event after attachment. The reconciliation
+        // read itself must discover the replacement rather than waiting for another projection.
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, bundle_map(&[])).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        manager.start_file_watcher().unwrap();
+        assert!(manager.selected(&id).is_err());
+    }
+
+    #[test]
     fn startup_qualifies_only_own_svid_anchors_and_mapped_empty_never_falls_back() {
         let local = generate_ca_material("same-name", 1);
         let foreign = generate_ca_material("same-name", 1);
@@ -657,7 +722,8 @@ mod tests {
                 &bad_local.cert_and_intermediates_der(),
                 &roots,
                 KeyUsage::client_auth(),
-                UnixTime::now()
+                UnixTime::now(),
+                &[],
             )
             .is_err()
         );
@@ -730,7 +796,8 @@ mod tests {
                 &old_cert.cert_and_intermediates_der(),
                 &selected.current(),
                 KeyUsage::client_auth(),
-                UnixTime::now()
+                UnixTime::now(),
+                &[],
             )
             .is_err()
         );

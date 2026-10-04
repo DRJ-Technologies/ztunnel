@@ -112,6 +112,7 @@ impl ConnSpawner {
             ssl,
             peer_identity.clone(),
             webpki::KeyUsage::server_auth(),
+            self.crl_manager.clone(),
         )?;
         let revocation = self.crl_manager.as_ref().map(|crl_manager| {
             crl_manager.register(

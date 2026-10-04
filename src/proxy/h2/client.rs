@@ -330,6 +330,7 @@ mod bundle_tests {
                     server_tls.get_ref().1,
                     client_id.clone(),
                     webpki::KeyUsage::client_auth(),
+                    None,
                 )
                 .unwrap();
             let client_handle = client
@@ -338,6 +339,7 @@ mod bundle_tests {
                     client_tls.get_ref().1,
                     server_id.clone(),
                     webpki::KeyUsage::server_auth(),
+                    None,
                 )
                 .unwrap();
             let cfg = Arc::new(crate::test_helpers::test_config());

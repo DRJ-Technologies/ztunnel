@@ -403,6 +403,7 @@ impl WorkloadCertificate {
         ssl: &CommonState,
         peer: Identity,
         usage: webpki::KeyUsage,
+        crls: Option<Arc<crate::tls::crl::CrlManager>>,
     ) -> Result<crate::tls::trust_domains::TrustDomainHandle, Error> {
         let manager = self.peer_bundle_manager(manager)?;
         let chain = ssl
@@ -413,7 +414,7 @@ impl WorkloadCertificate {
                 )
             })?
             .to_vec();
-        let handle = manager.register(peer, chain, usage);
+        let handle = manager.register_with_crls(peer, chain, usage, crls);
         if *handle.subscribe().borrow() {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,

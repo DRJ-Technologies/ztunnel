@@ -227,6 +227,7 @@ impl Inbound {
             ssl,
             peer.clone(),
             webpki::KeyUsage::client_auth(),
+            pi.crl_manager.clone(),
         )?;
         let revocation = pi.crl_manager.as_ref().map(|mgr| {
             mgr.register(

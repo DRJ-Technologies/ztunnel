@@ -304,6 +304,7 @@ impl OutboundConnection {
                 ssl,
                 peer.clone(),
                 webpki::KeyUsage::server_auth(),
+                self.pi.crl_manager.clone(),
             )?;
             let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
             let revocation = self.pi.crl_manager.as_ref().map(|crl_manager| {
