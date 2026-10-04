@@ -1,0 +1,37 @@
+name: Native watcher
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  watcher:
+    name: Native watcher attachment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RUSTFLAGS: -C force-frame-pointers
+      RUST_BACKTRACE: '1'
+      WATCHER_TEST: tls::trust_domains::tests::watcher_attachment_reconciles_projection_changed_after_initial_read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake libclang-dev pkg-config protobuf-compiler
+          rustup toolchain install 1.91.0 --profile minimal
+      - name: Run exact native watcher regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/native-watcher.log"
+          cargo +1.91.0 test --locked --lib --features testing -- --exact --test-threads=1 "$WATCHER_TEST" | tee "$test_log"
+          grep -Fx "test $WATCHER_TEST ... ok" "$test_log"
+          grep -E '^test result: ok\. 1 passed; 0 failed;' "$test_log"

@@ -49,7 +49,7 @@ pub struct ConnRegistration {
     /// presented peer chain (leaf first)
     presented_chain: Vec<CertificateDer<'static>>,
     /// Trust anchors the peer chain is verified against, matching what the handshake-time verifier used.
-    roots: Arc<RootCertStore>,
+    roots: crate::tls::trust_domains::PeerRoots,
     /// `client_auth` for an inbound peer (client) chain, `server_auth` for an outbound peer (server) chain.
     key_usage: KeyUsage,
     /// Directional rejection-metric reporter: `destination` inbound, `source` outbound.
@@ -76,12 +76,17 @@ impl ConnRegistration {
             .unwrap_or_default();
         Self {
             presented_chain,
-            roots,
+            roots: crate::tls::trust_domains::PeerRoots::new(roots),
             key_usage,
             reporter,
             peer_identity,
             established: UnixTime::now(),
         }
+    }
+
+    pub fn with_peer_roots(mut self, roots: crate::tls::trust_domains::PeerRoots) -> Self {
+        self.roots = roots;
+        self
     }
 
     fn peer(&self) -> String {
@@ -115,8 +120,8 @@ impl RevocationHandle {
             .map_or_else(|| "<unknown>".to_string(), |id| id.to_string())
     }
 
-    /// Resolves only when a CRL update actually revokes a cert in this connection's chain.
-    /// CRL reloads that don't affect this chain are ignored, so connection is torn down strictly on revocation.
+    /// Resolves for a rejected final registration or a native CRL proof of revocation.
+    /// An accepted registration always retains its leaf for later per-connection rechecks.
     pub async fn revoked(&mut self) {
         // The index's navigation sends the signal (after recording the metric); just await it
         loop {
@@ -132,7 +137,7 @@ impl RevocationHandle {
 
 /// wrapper around `verify_cert_chain` that gives revocation signal against a chain that was accepted at handshake.
 /// only `webpki::Error::CertRevoked` is considered for revocation status.
-fn chain_is_revoked(
+pub(crate) fn chain_is_revoked(
     crl_manager: &CrlManager,
     chain: &[CertificateDer<'static>],
     roots: &RootCertStore,
@@ -269,8 +274,8 @@ type Serial = Vec<u8>;
 
 /// One tracked tunnel, owned by its issuing CA node's `child_leaves`
 struct Leaf {
-    /// webpki validated cert chain (leaf -> IA(s), no root), retained for webpki verification
-    /// against updated CRLs during navigation
+    /// Full presented chain; native webpki reconstructs the valid path using current roots and CRLs.
+    /// Issuer-index metadata comes separately from the path verified during registration.
     chain: Vec<CertificateDer<'static>>,
     established: UnixTime,
     key_usage: KeyUsage,
@@ -278,9 +283,7 @@ struct Leaf {
     /// sends when connection is judged revoked.
     /// `Arc` so it can send *outside* the index lock.
     revoked_tx: Arc<watch::Sender<bool>>,
-    roots: Arc<RootCertStore>,
-    /// leaf cert serial number
-    serial: Serial,
+    roots: crate::tls::trust_domains::PeerRoots,
 }
 
 /// CA node (root or intermediate)
@@ -310,43 +313,24 @@ struct IndexInner {
 }
 
 /// Data for one webpki re-check during CA revocation,
-/// cloned out of the index under the snapshot lock so the crypto runs lock-free
+/// cloned out of the index before native crypto acquires the selected-store read guard
 struct LeafProbe {
     chain: Vec<CertificateDer<'static>>,
     established: UnixTime,
     key_usage: KeyUsage,
     reporter: Reporter,
-    roots: Arc<RootCertStore>,
+    roots: crate::tls::trust_domains::PeerRoots,
     revoked_tx: Arc<watch::Sender<bool>>,
-}
-
-/// target leaf to drop on a confirmed CA bulk-drop (no per-leaf webpki needed)
-struct DropTarget {
-    reporter: Reporter,
-    revoked_tx: Arc<watch::Sender<bool>>,
-}
-
-/// A CA-node bulk-drop candidate: probe `representative` once; if revoked, drop all of `subtree`.
-struct CaProbe {
-    representative: LeafProbe,
-    subtree: Vec<DropTarget>,
-}
-
-#[derive(Default)]
-struct NavWork {
-    leaf_probes: Vec<LeafProbe>,
-    ca_probes: Vec<CaProbe>,
 }
 
 /// Index of every tracked leaf, owned by [`CrlManager`].
-/// Navigation walks only leaves under CRL-issuing CA(s).
-/// Root/IA revocation bulk-drops its whole subtree after one confirming webpki call.
-/// Leaf revocation re-checks just the leaves whose serial the CRL lists.
+/// Each CRL reload rechecks every retained presentation against its current selected store.
+/// Registration-time DN/serial paths organize ownership only and cannot omit rotated paths.
 /// webpki remains the sole judge of revocation.
 ///
 /// register/deregister take write lock only for map mutations, and
-/// navigation snapshots the affected subtree under read lock and then
-/// webpki verification and teardown signals run outside the lock.
+/// navigation snapshots leaves under read lock and then releases the index lock.
+/// Each leaf's roots read lock spans native verification and teardown signaling.
 #[derive(Clone)]
 pub struct RevocationIndex {
     metrics: Arc<Metrics>,
@@ -369,79 +353,107 @@ impl RevocationIndex {
         let (tx, rx) = watch::channel(false);
         let tx = Arc::new(tx);
 
-        // grab CRL-reload generation before verifying
-        let gen_before = crl_manager.generation();
+        let tracked = conn.roots.with_current(|roots| {
+            // grab CRL-reload generation before verifying
+            let gen_before = crl_manager.generation();
 
-        // Verify again to obtain the verified path, and route the index by that instead of the peer's presented chain order.
-        // Presented chains can be compromised or non-conforming that still handshake (webpki ignores unused ones)
-        // and corrupt index structure causing a missed connection revocation.
-        let (tracked, verified_chain) = match conn.presented_chain.split_first() {
-            None => {
-                warn!(
-                    peer = conn.peer(),
-                    "crl index: peer presented no certificates; connection not tracked"
-                );
-                self.metrics.record_crl_untracked_connection(conn.reporter);
-                (None, None)
-            }
-            Some((leaf, presented_ias)) => {
-                let crls = crl_manager.get_crls();
-                match verify_cert_chain(
-                    leaf,
-                    presented_ias,
-                    &conn.roots,
-                    conn.established,
-                    conn.key_usage,
-                    &crls,
-                ) {
-                    // insert with the verified chain
-                    Ok(verified) => {
-                        let mut chain = Vec::with_capacity(verified.intermediates.len() + 1);
-                        chain.push(leaf.clone());
-                        chain.extend(verified.intermediates);
-                        let tracked = self.inner.write().unwrap().insert(
-                            &conn,
-                            &chain,
-                            tx.clone(),
-                            &self.metrics,
-                        );
-                        (tracked, Some(chain))
-                    }
-                    // already revoked by current CRLs: drop the connection
-                    Err(webpki::Error::CertRevoked) => {
-                        drop_revoked(&self.metrics, conn.reporter, &tx);
-                        (None, None)
-                    }
-                    // handshake already verified this chain, so a failure here is
-                    // likely the result of a race between state updates and verifyForUse calls
-                    Err(e) => {
-                        warn!(
-                            peer = conn.peer(),
-                            error = %e,
-                            "crl index: re-verification failed; connection not tracked"
-                        );
-                        self.metrics.record_crl_untracked_connection(conn.reporter);
-                        (None, None)
+            // Use the native verified path for ownership metadata, ignoring unused presentation
+            // certificates. All later rechecks retain the full presentation for root rotation.
+            let tracked = match conn.presented_chain.split_first() {
+                None => {
+                    warn!(
+                        peer = conn.peer(),
+                        "crl index: peer presented no certificates; connection not tracked"
+                    );
+                    self.metrics.record_crl_untracked_connection(conn.reporter);
+                    None
+                }
+                Some((leaf, presented_ias)) => {
+                    let crls = crl_manager.get_crls();
+                    match verify_cert_chain(
+                        leaf,
+                        presented_ias,
+                        roots,
+                        conn.established,
+                        conn.key_usage,
+                        &crls,
+                    ) {
+                        // insert with the verified chain
+                        Ok(verified) => {
+                            let mut chain = Vec::with_capacity(verified.intermediates.len() + 1);
+                            chain.push(leaf.clone());
+                            chain.extend(verified.intermediates);
+                            let tracked = self.inner.write().unwrap().insert(
+                                &conn,
+                                &chain,
+                                tx.clone(),
+                                &self.metrics,
+                            );
+                            tracked
+                        }
+                        // already revoked by current CRLs: drop the connection
+                        Err(webpki::Error::CertRevoked) => {
+                            drop_revoked(&self.metrics, conn.reporter, &tx);
+                            None
+                        }
+                        // A foreign, same-name issuer CRL can cause a native signature error
+                        // after TLS admission. Preserve the independently trusted leaf in the
+                        // index so a later valid issuer CRL can still revoke it.
+                        Err(e) => {
+                            warn!(peer = conn.peer(), error = %e,
+                                "crl re-verification failed; retaining only a current-root-qualified chain");
+                            match verify_cert_chain(leaf, presented_ias, roots, conn.established, conn.key_usage, &[]) {
+                                Ok(verified) => {
+                                    let mut chain = Vec::with_capacity(verified.intermediates.len() + 1);
+                                    chain.push(leaf.clone());
+                                    chain.extend(verified.intermediates);
+                                    self.inner.write().unwrap().insert(&conn, &chain, tx.clone(), &self.metrics)
+                                }
+                                Err(error) => {
+                                    warn!(peer = conn.peer(), error = %error,
+                                        "current roots no longer verify new connection registration");
+                                    self.metrics.record_crl_untracked_connection(conn.reporter);
+                                    // A rejected registration cannot leave an accepted, untracked tunnel.
+                                    let _ = tx.send(true);
+                                    None
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        // changed generation means a crl reload happened since verify + insert above executed, so
-        // `navigate` may have run before this leaf was inserted and missed it.
-        // re-check the verified chain against the current CRLs now that we're inserted, and drop if it is now revoked.
-        if tracked.is_some()
-            && revoked_after_reload(
-                gen_before,
-                crl_manager.generation(),
-                verified_chain.as_deref(),
-                &crl_manager.get_crls(),
-                &conn.roots,
-                conn.key_usage,
-                conn.established,
-            )
-        {
-            drop_revoked(&self.metrics, conn.reporter, &tx);
+            // changed generation means a crl reload happened since verify + insert above executed, so
+            // `navigate` may have run before this leaf was inserted and missed it.
+            // re-check the full presentation against current CRLs after insertion, under the selected-store guard.
+            if tracked.is_some()
+                && revoked_after_reload(
+                    gen_before,
+                    crl_manager.generation(),
+                    Some(&conn.presented_chain),
+                    &crl_manager.get_crls(),
+                    roots,
+                    conn.key_usage,
+                    conn.established,
+                )
+            {
+                drop_revoked(&self.metrics, conn.reporter, &tx);
+            }
+
+            tracked
+        });
+
+        if tracked.is_none() {
+            // Final registration either owns a leaf for future native rechecks or rejects the
+            // new tunnel. Never return a live, permanently untracked connection on any error.
+            let _ = tx.send_if_modified(|rejected| {
+                if *rejected {
+                    false
+                } else {
+                    *rejected = true;
+                    true
+                }
+            });
         }
 
         RevocationHandle {
@@ -454,36 +466,28 @@ impl RevocationIndex {
         }
     }
 
-    /// Navigate the index and re-evaluate their existing connections after a CRL reload.
-    /// Snapshots the matched subtrees under a brief read lock (pre-filtered by serial),
-    /// then runs webpki and, on revocation, sends teardown signals outside the lock.
+    /// Recheck all retained presentations: a root rotation may select an issuer path absent
+    /// from registration-time routing metadata. Native crypto decides each leaf independently.
     pub fn navigate(&self, crl_manager: &CrlManager) {
-        let crls = crl_manager.get_crls();
-        if crls.is_empty() {
+        self.navigate_with(crl_manager, || {});
+    }
+
+    // The no-op production hook lets native fixtures pause inside the actual
+    // selected-store read guard to prove root updates cannot interleave verification and signal.
+    fn navigate_with(&self, crl_manager: &CrlManager, before_verify: impl Fn()) {
+        if crl_manager.get_crls().is_empty() {
             return;
         }
-        // group crls by issuer so we can easily find the ca issuer and leaves matching revoked serials
-        let mut by_issuer: HashMap<&[u8], Vec<&CertRevocationList<'static>>> = HashMap::new();
-        for crl in crls.iter() {
-            by_issuer.entry(crl.issuer()).or_default().push(crl);
-        }
-
-        let work = self.inner.read().unwrap().collect_work(&by_issuer);
-
-        // Leaf-level revocations: confirm each candidate leaf with webpki
-        for p in &work.leaf_probes {
-            if chain_is_revoked(crl_manager, &p.chain, &p.roots, p.key_usage, p.established) {
-                drop_revoked(&self.metrics, p.reporter, &p.revoked_tx);
-            }
-        }
-        // root or ia revocations: one confirming webpki call on representative leaf, then bulk-drop whole subtree
-        for ca in &work.ca_probes {
-            let r = &ca.representative;
-            if chain_is_revoked(crl_manager, &r.chain, &r.roots, r.key_usage, r.established) {
-                for t in &ca.subtree {
-                    drop_revoked(&self.metrics, t.reporter, &t.revoked_tx);
+        // Never hold the index lock while acquiring selected roots (registration takes reverse
+        // order). CRL publication likewise releases its own inner lock before invoking this walk.
+        let probes = self.inner.read().unwrap().collect_work();
+        for p in &probes {
+            p.roots.with_current(|roots| {
+                before_verify();
+                if chain_is_revoked(crl_manager, &p.chain, roots, p.key_usage, p.established) {
+                    drop_revoked(&self.metrics, p.reporter, &p.revoked_tx);
                 }
-            }
+            });
         }
     }
 
@@ -578,12 +582,13 @@ impl IndexInner {
         self.nodes.get_mut(&cur)?.child_leaves.insert(
             leaf_id,
             Leaf {
-                chain: verified_chain.to_vec(),
+                // Retain the presentation for native path construction after root rotation;
+                // only the verified path above supplies issuer-index routing metadata.
+                chain: conn.presented_chain.clone(),
                 roots: conn.roots.clone(),
                 key_usage: conn.key_usage,
                 established: conn.established,
                 reporter: conn.reporter,
-                serial: leaf.serial,
                 revoked_tx: tx,
             },
         );
@@ -691,78 +696,18 @@ impl IndexInner {
         }
     }
 
-    /// Walk every node once; a node whose subject DN matches a loaded CRL's issuer is a CRL signer,
-    /// so serial-match its children (CAs and leaves) against issuer's CRL(s) to collect webpki re-verification work.
-    fn collect_work(
-        &self,
-        by_issuer: &HashMap<&[u8], Vec<&CertRevocationList<'static>>>,
-    ) -> NavWork {
-        let mut work = NavWork::default();
-        for node in self.nodes.values() {
-            // check if ca node is an issuer of any CRLs
-            let Some(crls) = by_issuer.get(node.subject_dn.as_slice()) else {
-                continue;
-            };
-            // check issuer's child CA serials for CRL serial match
-            for (child_serial, &child_id) in &node.child_cas {
-                if serial_in_any(crls, child_serial) {
-                    // have a match, collect subtree to be webpki verified and, on success, dropped
-                    if let Some(probe) = self.collect_subtree(child_id) {
-                        work.ca_probes.push(probe);
-                    }
-                }
-            }
-            // check issuer's leaf serials for CRL serial match
-            // quick iteration to collect those revoked instead of running everything through webpki flow
-            for leaf in node.child_leaves.values() {
-                if serial_in_any(crls, &leaf.serial) {
-                    work.leaf_probes.push(self.leaf_probe(leaf));
-                }
-            }
-        }
-        work
+    /// Ownership nodes can retain an old verified path; they cannot prefilter current authority.
+    fn collect_work(&self) -> Vec<LeafProbe> {
+        self.nodes
+            .values()
+            .flat_map(|node| node.child_leaves.values().map(|leaf| self.leaf_probe(leaf)))
+            .collect()
     }
-
-    /// Collect every leaf in the subtree rooted at `ca` so it can be closed.
-    /// `representative` is for the confirming webpki call of an IA revocation.
-    fn collect_subtree(&self, ca: NodeId) -> Option<CaProbe> {
-        let mut representative = None;
-        let mut subtree = Vec::new();
-        let mut stack = vec![ca];
-        while let Some(id) = stack.pop() {
-            let Some(node) = self.nodes.get(&id) else {
-                continue;
-            };
-            // collect leaf targets to drop in event webpki returns revoked on IA-level revocation.
-            // representative leaf needed to feed to webpki verifier as end entity.
-            for leaf in node.child_leaves.values() {
-                if representative.is_none() {
-                    representative = Some(self.leaf_probe(leaf));
-                }
-                subtree.push(DropTarget {
-                    reporter: leaf.reporter,
-                    revoked_tx: leaf.revoked_tx.clone(),
-                });
-            }
-            // if node has child CAs then we need to collect those too
-            stack.extend(node.child_cas.values().copied());
-        }
-        representative.map(|representative| CaProbe {
-            representative,
-            subtree,
-        })
-    }
-}
-
-fn serial_in_any(crls: &[&CertRevocationList<'static>], serial: &Serial) -> bool {
-    crls.iter()
-        .any(|crl| matches!(crl.find_serial(serial.as_slice()), Ok(Some(_))))
 }
 
 /// Drop a connection by firing a connection's teardown signal and record the CRL-rejection metric on first transition.
 /// Idempotent bc a connection can be reached by more than one path for a single revocation —
-/// a bulk-drop plus a leaf-serial match in one `navigate`, or
-/// a register-time self-check racing a concurrent `navigate`,
+/// a register-time self-check racing a concurrent `navigate`.
 fn drop_revoked(metrics: &Metrics, reporter: Reporter, tx: &watch::Sender<bool>) {
     let newly_revoked = tx.send_if_modified(|revoked| {
         if *revoked {
@@ -848,7 +793,7 @@ mod tests {
     ) -> ConnRegistration {
         ConnRegistration {
             presented_chain: chain,
-            roots,
+            roots: crate::tls::trust_domains::PeerRoots::new(roots),
             key_usage: KeyUsage::server_auth(),
             reporter: crate::proxy::metrics::Reporter::source,
             peer_identity: None,
@@ -858,45 +803,7 @@ mod tests {
 
     type CaMaterial = (rcgen::KeyPair, rcgen::CertificateParams);
 
-    /// A cert and crl signing CA with subject `CN=<cn>` and the given serial.
-    fn gen_ca(cn: &str, serial: u64) -> CaMaterial {
-        use rcgen::*;
-        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut p = CertificateParams::default();
-        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        p.serial_number = Some(SerialNumber::from(serial));
-        let now = SystemTime::now();
-        p.not_before = now.into();
-        p.not_after = (now + Duration::from_secs(3600)).into();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, cn);
-        p.distinguished_name = dn;
-        (kp, p)
-    }
-
-    /// A workload leaf (serverAuth+clientAuth, SPIFFE URI SAN) with the given serial.
-    fn gen_leaf(spiffe: &str, serial: u64) -> CaMaterial {
-        use rcgen::*;
-        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut p = CertificateParams::default();
-        p.serial_number = Some(SerialNumber::from(serial));
-        let now = SystemTime::now();
-        p.not_before = now.into();
-        p.not_after = (now + Duration::from_secs(3600)).into();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "leaf");
-        p.distinguished_name = dn;
-        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        p.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        p.subject_alt_names = vec![SanType::URI(
-            string::Ia5String::try_from(spiffe.to_string()).unwrap(),
-        )];
-        (kp, p)
-    }
+    use crate::tls::mock::{generate_ca_material as gen_ca, generate_leaf_material as gen_leaf};
 
     fn self_signed(ca: &CaMaterial) -> CertificateDer<'static> {
         ca.1.self_signed(&ca.0).unwrap().der().clone()
@@ -967,8 +874,7 @@ mod tests {
     // ---- encoding parity between x509-parser and webpki crates ----
 
     /// `parse_cert` derives index routing keys, `navigate` matches them against webpki's `CertRevocationList`.
-    /// If the byte encodings diverge, `collect_work`'s issuer-DN lookup and
-    /// `serial_in_any`'s serial match miss silently and a revoked cert keeps serving (false negative).
+    /// Preserve native certificate/CRL encoding parity for ownership metadata and diagnostics.
     #[test]
     fn parse_cert_matches_webpki_crl_encoding() {
         let ca = gen_ca("parity-ca", 1);
@@ -981,7 +887,7 @@ mod tests {
         let ca_info = parse_cert(&ca_der).expect("parse ca cert");
         let leaf_info = parse_cert(&leaf_der).expect("parse leaf cert");
 
-        // subject <-> issuer DN join (what collect_work does):
+        // Native subject <-> issuer DN encoding:
         // the x509-parser DN (SEQUENCE content) must byte-match webpki's crl.issuer()
         assert_eq!(
             ca_info.subject_dn.as_slice(),
@@ -1080,7 +986,7 @@ mod tests {
         // Retain what the expiry-masking regression check at the end needs,
         // since `register` consumes the conn registration.
         let chain = reg.presented_chain.clone();
-        let roots = reg.roots.clone();
+        let roots = reg.roots.current();
         let established = reg.established;
         // populate index by registering the connection
         let mut revocation = Some(crl_mgr.register(reg));
@@ -1183,7 +1089,7 @@ mod tests {
 
     /// A CRL reload closes an existing connection when it revokes an intermediate.
     /// Exercises [`ConnRegistration::from_conn`] capturing a multi-cert peer chain from a live TLS session,
-    /// and drives IA bulk-drop path through handshake + reload + navigate.
+    /// and drives IA per-leaf recheck path through handshake + reload + navigate.
     /// If `from_conn` ever dropped or reordered intermediates,
     /// the index would build the wrong tree and this revocation would be missed.
     #[tokio::test]
@@ -1262,7 +1168,7 @@ mod tests {
         );
 
         // Revoke the intermediate (by its serial); the leaf's own serial is never listed, so this
-        // can only close the connection via the IA bulk-drop path.
+        // can only close the connection via the IA per-leaf recheck path.
         write_crl(&mut crl_file, &crl_pem_revoking_cert(&ia_serial));
         crl_mgr.load_crl().unwrap();
 
@@ -1271,7 +1177,7 @@ mod tests {
             wait_for_revocation(revocation.as_mut()),
         )
         .await
-        .expect("bulk-drop must close the connection once its intermediate is revoked");
+        .expect("per-leaf recheck must close the connection once its intermediate is revoked");
     }
 
     /// Register-time self-check closes a connection whose cert is revoked after initial handshake.
@@ -1404,10 +1310,10 @@ mod tests {
         );
     }
 
-    /// Validate the bulk-drop path:
+    /// Validate the per-leaf CA recheck path:
     /// revoked ia (serial only) closes the leaf via its IA's subtree
     #[tokio::test]
-    async fn index_bulk_drops_subtree_on_ia_revocation() {
+    async fn index_rechecks_subtree_on_ia_revocation() {
         initialize_telemetry();
         let root = gen_ca("test-root", 1);
         let ia = gen_ca("test-ia", 2);
@@ -1439,7 +1345,7 @@ mod tests {
             wait_for_revocation(Some(&mut handle)),
         )
         .await
-        .expect("bulk-drop must close the leaf when its intermediate CA is revoked");
+        .expect("per-leaf recheck must close the leaf when its intermediate CA is revoked");
     }
 
     /// leaf revocation via IA-signed CRL should close it
@@ -1588,7 +1494,7 @@ mod tests {
     /// Bulk-drop fan-out:
     /// revoked IA must close all leaves beneath it after single confirming webpki call.
     #[tokio::test]
-    async fn index_bulk_drop_all_leaves_under_revoked_ia() {
+    async fn index_rechecks_all_leaves_under_revoked_ia() {
         initialize_telemetry();
         let root = gen_ca("test-root", 1);
         let ia = gen_ca("test-ia", 2);
@@ -1625,7 +1531,7 @@ mod tests {
     /// revoking IA_1 must close a leaf two levels below it.
     /// exercises multi-level insert and subtree walk recursing through a child CA.
     #[tokio::test]
-    async fn index_bulk_drop_through_multiple_ia_levels() {
+    async fn index_rechecks_multiple_ia_levels() {
         initialize_telemetry();
         let root = gen_ca("test-root", 1);
         let ia1 = gen_ca("test-ia-1", 2);
@@ -1762,5 +1668,537 @@ mod tests {
         )
         .await
         .expect("verified-path routing must drop the leaf despite the presented junk intermediate");
+    }
+    #[tokio::test]
+    async fn mapped_peer_store_crl_registration_tracks_foreign_chain_both_usages() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        let own = gen_ca("same-subject", 1);
+        let foreign = gen_ca("same-subject", 2);
+        let foreign_pem = foreign.1.self_signed(&foreign.0).unwrap().pem();
+        let own_pem = own.1.self_signed(&own.0).unwrap().pem();
+        let manager = TrustDomainManager::from_bundle_map(&bundle_map(&[
+            ("local", vec![own_pem.as_bytes()]),
+            ("foreign", vec![foreign_pem.as_bytes()]),
+        ]))
+        .unwrap();
+        let id = Identity::from_str("spiffe://foreign/ns/n/sa/f").unwrap();
+        let leaf = gen_leaf(&id.to_string(), 99);
+        let chain = vec![signed_by(&leaf, &foreign)];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            let selected = manager.register(id.clone(), chain.clone(), usage);
+            let (mut crl_file, crl_mgr) = crl_manager_empty();
+            let mut registration = conn_reg(chain.clone(), selected.roots.current())
+                .with_peer_roots(selected.roots.clone());
+            registration.key_usage = usage;
+            let mut handle = crl_mgr.register(registration);
+            assert!(!*handle.subscribe_revoked().borrow());
+            write_crl(&mut crl_file, &crl_pem_signed(&foreign, 1, &[99]));
+            crl_mgr.load_crl().unwrap();
+            tokio::time::timeout(Duration::from_secs(1), handle.revoked())
+                .await
+                .expect("selected foreign issuer must revoke");
+        }
+    }
+
+    #[test]
+    fn native_crl_issuer_chain_and_expiry_policy_limits_are_explicit() {
+        let root = gen_ca("root", 1);
+        let ia = gen_ca("intermediate", 2);
+        let unrelated = gen_ca("other", 3);
+        let leaf = gen_leaf("spiffe://td/ns/n/sa/a", 99);
+        let chain = [signed_by(&leaf, &ia), signed_by(&ia, &root)];
+        let mut roots = RootCertStore::empty();
+        roots.add(self_signed(&root)).unwrap();
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            assert!(matches!(
+                verify_cert_chain(
+                    &chain[0],
+                    &chain[1..],
+                    &roots,
+                    UnixTime::now(),
+                    usage,
+                    &[webpki_crl(&ia, 1, &[99])]
+                ),
+                Err(webpki::Error::CertRevoked)
+            ));
+            assert!(matches!(
+                verify_cert_chain(
+                    &chain[0],
+                    &chain[1..],
+                    &roots,
+                    UnixTime::now(),
+                    usage,
+                    &[webpki_crl(&root, 1, &[2])]
+                ),
+                Err(webpki::Error::CertRevoked)
+            ));
+            // Native Rust policy allows missing issuer/chain coverage, unlike Envoy CRL_CHECK_ALL.
+            assert!(
+                verify_cert_chain(
+                    &chain[0],
+                    &chain[1..],
+                    &roots,
+                    UnixTime::now(),
+                    usage,
+                    &[webpki_crl(&unrelated, 1, &[99])]
+                )
+                .is_ok()
+            );
+            assert!(
+                verify_cert_chain(
+                    &chain[0],
+                    &chain[1..],
+                    &roots,
+                    UnixTime::now(),
+                    usage,
+                    &[webpki_crl(&ia, 1, &[])]
+                )
+                .is_ok()
+            );
+            let now = time::OffsetDateTime::now_utc();
+            let params = rcgen::CertificateRevocationListParams {
+                this_update: now - time::Duration::hours(2),
+                next_update: now - time::Duration::hours(1),
+                crl_number: 1.into(),
+                issuing_distribution_point: None,
+                revoked_certs: vec![],
+                key_identifier_method: rcgen::KeyIdMethod::Sha256,
+            };
+            let signed = params
+                .signed_by(&rcgen::Issuer::from_params(&ia.1, &ia.0))
+                .unwrap();
+            let stale = webpki::OwnedCertRevocationList::from_der(signed.der())
+                .unwrap()
+                .into();
+            // Existing ExpirationPolicy::Ignore is retained; this is a documented limit, no clearance.
+            assert!(
+                verify_cert_chain(
+                    &chain[0],
+                    &chain[1..],
+                    &roots,
+                    UnixTime::now(),
+                    usage,
+                    &[stale]
+                )
+                .is_ok()
+            );
+            let wrong_signer = gen_ca("intermediate", 3);
+            let wrong_crl = webpki_crl(&wrong_signer, 1, &[99]);
+            assert!(
+                verify_cert_chain(
+                    &chain[0],
+                    &chain[1..],
+                    &roots,
+                    UnixTime::now(),
+                    usage,
+                    &[wrong_crl]
+                )
+                .is_err(),
+                "issuer DN alone must not establish CRL authority"
+            );
+        }
+    }
+    /// Independent roots and IAs deliberately collide in DN and serial. The routing node may
+    /// therefore contain both domains, but only each leaf's current cryptographic path is authority.
+    #[test]
+    fn mapped_ca_dn_serial_collision_qualifies_each_leaf_current_store() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        let root_a = gen_ca("same-root", 1);
+        let root_b = gen_ca("same-root", 1);
+        let ia_a = gen_ca("same-ia", 2);
+        let ia_b = gen_ca("same-ia", 2);
+        let root_a_pem = root_a.1.self_signed(&root_a.0).unwrap().pem();
+        let root_b_pem = root_b.1.self_signed(&root_b.0).unwrap().pem();
+        let a_id = Identity::from_str("spiffe://a/ns/n/sa/a").unwrap();
+        let b_id = Identity::from_str("spiffe://b/ns/n/sa/b").unwrap();
+        let a_chain = vec![
+            signed_by(&gen_leaf(&a_id.to_string(), 99), &ia_a),
+            signed_by(&ia_a, &root_a),
+        ];
+        let b_chain = vec![
+            signed_by(&gen_leaf(&b_id.to_string(), 99), &ia_b),
+            signed_by(&ia_b, &root_b),
+        ];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            let mut map_file = NamedTempFile::new().unwrap();
+            // An explicit rotation set shrinks before CRL verification: the store captured when
+            // registered is not the current store. All current authority remains domain-associated.
+            map_file
+                .write_all(&bundle_map(&[
+                    ("a", vec![root_a_pem.as_bytes()]),
+                    ("b", vec![root_a_pem.as_bytes(), root_b_pem.as_bytes()]),
+                ]))
+                .unwrap();
+            let manager = TrustDomainManager::new(map_file.path().to_path_buf());
+            let selected_a = manager.register(a_id.clone(), a_chain.clone(), usage);
+            let selected_b = manager.register(b_id.clone(), b_chain.clone(), usage);
+            assert_eq!(selected_b.roots.current().len(), 2);
+            let (mut crl_file, crl_mgr) = crl_manager_empty();
+            let mut a_reg = conn_reg(a_chain.clone(), selected_a.roots.current())
+                .with_peer_roots(selected_a.roots.clone());
+            a_reg.key_usage = usage;
+            let mut b_reg = conn_reg(b_chain.clone(), selected_b.roots.current())
+                .with_peer_roots(selected_b.roots.clone());
+            b_reg.key_usage = usage;
+            let a = crl_mgr.register(a_reg);
+            let b = crl_mgr.register(b_reg);
+            use std::io::{Seek, SeekFrom};
+            map_file.as_file_mut().set_len(0).unwrap();
+            map_file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+            map_file
+                .write_all(&bundle_map(&[
+                    ("a", vec![root_a_pem.as_bytes()]),
+                    ("b", vec![root_b_pem.as_bytes()]),
+                ]))
+                .unwrap();
+            manager.reload().unwrap();
+            assert_eq!(selected_b.roots.current().len(), 1);
+            assert!(!*selected_a.subscribe().borrow());
+            assert!(!*selected_b.subscribe().borrow());
+            // A representative cannot satisfy both assertions: if it selects A it falsely drops B;
+            // if it selects B it misses A. HashMap traversal order is irrelevant to the verdict.
+            write_crl(&mut crl_file, &crl_pem_signed(&root_a, 1, &[2]));
+            crl_mgr.load_crl().unwrap();
+            assert!(
+                *a.subscribe_revoked().borrow(),
+                "A must close under its current issuer's signed CRL"
+            );
+            assert!(
+                !*b.subscribe_revoked().borrow(),
+                "independent B must survive a colliding DN+serial"
+            );
+            // Only B's independently signed issuer CRL can authorize B's teardown.
+            write_crl(&mut crl_file, &crl_pem_signed(&root_b, 2, &[2]));
+            crl_mgr.load_crl().unwrap();
+            assert!(
+                *b.subscribe_revoked().borrow(),
+                "B must close when its own current issuer revokes"
+            );
+        }
+    }
+
+    /// The shared intermediate key has two native issuer paths. Root rotation removes the path
+    /// selected when registered, but the remaining current path must preserve this connection.
+    /// A CRL from the removed issuer cannot substitute for proof under the remaining selected root.
+    #[test]
+    fn current_selected_store_rebuilds_presented_paths_before_per_leaf_crl_teardown() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        let root_a = gen_ca("same-root", 1);
+        let root_b = gen_ca("same-root", 1);
+        let ia = gen_ca("same-ia", 2);
+        let root_a_pem = root_a.1.self_signed(&root_a.0).unwrap().pem();
+        let root_b_pem = root_b.1.self_signed(&root_b.0).unwrap().pem();
+        let id = Identity::from_str("spiffe://a/ns/n/sa/a").unwrap();
+        let chain = vec![
+            signed_by(&gen_leaf(&id.to_string(), 99), &ia),
+            signed_by(&ia, &root_a),
+            signed_by(&ia, &root_b),
+        ];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(&bundle_map(&[(
+                "a",
+                vec![root_a_pem.as_bytes(), root_b_pem.as_bytes()],
+            )]))
+            .unwrap();
+            let manager = TrustDomainManager::new(file.path().to_path_buf());
+            let selected = manager.register(id.clone(), chain.clone(), usage);
+            let (mut crl_file, crl_mgr) = crl_manager_empty();
+            let mut reg = conn_reg(chain.clone(), selected.roots.current())
+                .with_peer_roots(selected.roots.clone());
+            reg.key_usage = usage;
+            let tracked = crl_mgr.register(reg);
+            use std::io::{Seek, SeekFrom};
+            file.as_file_mut().set_len(0).unwrap();
+            file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&bundle_map(&[("a", vec![root_b_pem.as_bytes()])]))
+                .unwrap();
+            manager.reload().unwrap();
+            assert!(
+                !*selected.subscribe().borrow(),
+                "remaining native path must preserve the mapped tunnel"
+            );
+            write_crl(&mut crl_file, &crl_pem_signed(&root_a, 1, &[2]));
+            crl_mgr.load_crl().unwrap();
+            assert!(
+                !*tracked.subscribe_revoked().borrow(),
+                "removed root's CRL cannot authorize teardown"
+            );
+            write_crl(&mut crl_file, &crl_pem_signed(&root_b, 2, &[2]));
+            crl_mgr.load_crl().unwrap();
+            assert!(
+                *tracked.subscribe_revoked().borrow(),
+                "current root's CRL must revoke the reconstructed path"
+            );
+        }
+    }
+
+    /// Different root DNs and cross-signing serials must not hide a newly selected issuer path.
+    /// Run both CRL-after-rotation and already-loaded-CRL timelines for both native TLS purposes.
+    #[test]
+    fn rotated_distinct_issuer_paths_enforce_new_and_preloaded_crls() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        use std::io::{Seek, SeekFrom};
+        let root_a = gen_ca("root-a", 1);
+        let root_b = gen_ca("root-b", 1);
+        let root_c = gen_ca("unaffected-root", 1);
+        let ia = gen_ca("shared-ia", 2);
+        let mut b_params = ia.1.clone();
+        b_params.serial_number = Some(rcgen::SerialNumber::from(3u64));
+        let b_ia = b_params
+            .signed_by(&ia.0, &rcgen::Issuer::from_params(&root_b.1, &root_b.0))
+            .unwrap()
+            .der()
+            .clone();
+        let a_pem = root_a.1.self_signed(&root_a.0).unwrap().pem();
+        let b_pem = root_b.1.self_signed(&root_b.0).unwrap().pem();
+        let c_pem = root_c.1.self_signed(&root_c.0).unwrap().pem();
+        let id = Identity::from_str("spiffe://a/ns/n/sa/a").unwrap();
+        let other_id = Identity::from_str("spiffe://b/ns/n/sa/b").unwrap();
+        let chain = vec![
+            signed_by(&gen_leaf(&id.to_string(), 99), &ia),
+            signed_by(&ia, &root_a),
+            b_ia,
+        ];
+        let other_chain = vec![signed_by(&gen_leaf(&other_id.to_string(), 99), &root_c)];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            for preload in [false, true] {
+                let (mut crl_file, crls) = crl_manager_empty();
+                let mut map = NamedTempFile::new().unwrap();
+                map.write_all(&bundle_map(&[
+                    ("a", vec![a_pem.as_bytes()]),
+                    ("b", vec![c_pem.as_bytes()]),
+                ]))
+                .unwrap();
+                let manager = TrustDomainManager::new(map.path().to_path_buf());
+                let selected = manager.register_with_crls(
+                    id.clone(),
+                    chain.clone(),
+                    usage,
+                    Some(crls.clone()),
+                );
+                let other = manager.register_with_crls(
+                    other_id.clone(),
+                    other_chain.clone(),
+                    usage,
+                    Some(crls.clone()),
+                );
+                let mut reg = conn_reg(chain.clone(), selected.roots.current())
+                    .with_peer_roots(selected.roots.clone());
+                reg.key_usage = usage;
+                let tracked = crls.register(reg);
+                let mut reg = conn_reg(other_chain.clone(), other.roots.current())
+                    .with_peer_roots(other.roots.clone());
+                reg.key_usage = usage;
+                let other_tracked = crls.register(reg);
+                if preload {
+                    write_crl(&mut crl_file, &crl_pem_signed(&root_b, 1, &[3]));
+                    crls.load_crl().unwrap();
+                    assert!(
+                        !*tracked.subscribe_revoked().borrow(),
+                        "A path remains unrevoked before rotation"
+                    );
+                }
+                map.as_file_mut().set_len(0).unwrap();
+                map.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+                map.write_all(&bundle_map(&[
+                    ("a", vec![b_pem.as_bytes()]),
+                    ("b", vec![c_pem.as_bytes()]),
+                ]))
+                .unwrap();
+                manager.reload().unwrap();
+                if preload {
+                    assert!(
+                        *selected.subscribe().borrow(),
+                        "map update must enforce B's already-loaded CRL"
+                    );
+                    let rejected = manager.register_with_crls(
+                        id.clone(),
+                        chain.clone(),
+                        usage,
+                        Some(crls.clone()),
+                    );
+                    assert!(
+                        *rejected.subscribe().borrow(),
+                        "registration cannot restore the revoked B path"
+                    );
+                } else {
+                    assert!(!*selected.subscribe().borrow());
+                    write_crl(&mut crl_file, &crl_pem_signed(&root_b, 1, &[3]));
+                    crls.load_crl().unwrap();
+                    assert!(matches!(
+                        verify_cert_chain(
+                            &chain[0],
+                            &chain[1..],
+                            &selected.roots.current(),
+                            UnixTime::now(),
+                            usage,
+                            &crls.get_crls()
+                        ),
+                        Err(webpki::Error::CertRevoked)
+                    ));
+                    assert!(
+                        *tracked.subscribe_revoked().borrow(),
+                        "new issuer DN/serial must not be filtered by old path"
+                    );
+                }
+                assert!(!*other.subscribe().borrow());
+                assert!(
+                    !*other_tracked.subscribe_revoked().borrow(),
+                    "unaffected leaf must retain its independent current store"
+                );
+            }
+        }
+    }
+
+    /// Pause the actual navigation pipeline while its selected-store read guard is held. A mapped
+    /// update cannot publish new roots between the native cryptographic verdict and its signal.
+    #[test]
+    fn root_rotation_serializes_crl_verdict_and_signal_in_both_tls_roles() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        use std::io::{Seek, SeekFrom};
+        use std::sync::{Mutex, mpsc};
+        let root_a = gen_ca("root-a", 1);
+        let root_b = gen_ca("root-b", 1);
+        let ia = gen_ca("shared-ia", 2);
+        let mut b_params = ia.1.clone();
+        b_params.serial_number = Some(rcgen::SerialNumber::from(3u64));
+        let b_ia = b_params
+            .signed_by(&ia.0, &rcgen::Issuer::from_params(&root_b.1, &root_b.0))
+            .unwrap()
+            .der()
+            .clone();
+        let a_pem = root_a.1.self_signed(&root_a.0).unwrap().pem();
+        let b_pem = root_b.1.self_signed(&root_b.0).unwrap().pem();
+        let id = Identity::from_str("spiffe://a/ns/n/sa/a").unwrap();
+        let chain = vec![
+            signed_by(&gen_leaf(&id.to_string(), 99), &ia),
+            signed_by(&ia, &root_a),
+            b_ia,
+        ];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            for revoke_old in [false, true] {
+                let (mut crl_file, crls) = crl_manager_empty();
+                let mut map = NamedTempFile::new().unwrap();
+                map.write_all(&bundle_map(&[("a", vec![a_pem.as_bytes()])]))
+                    .unwrap();
+                let manager = TrustDomainManager::new(map.path().to_path_buf());
+                let selected = manager.register_with_crls(
+                    id.clone(),
+                    chain.clone(),
+                    usage,
+                    Some(crls.clone()),
+                );
+                // This standalone native index lets the fixture stop between CRL publication and
+                // navigation, exactly where production load_crl invokes the same navigation method.
+                let index = RevocationIndex::new(test_proxy_metrics());
+                let mut reg = conn_reg(chain.clone(), selected.roots.current())
+                    .with_peer_roots(selected.roots.clone());
+                reg.key_usage = usage;
+                let tracked = index.register(&crls, reg);
+                write_crl(
+                    &mut crl_file,
+                    &if revoke_old {
+                        crl_pem_signed(&root_a, 1, &[2])
+                    } else {
+                        crl_pem_signed(&root_b, 1, &[3])
+                    },
+                );
+                crls.load_crl().unwrap();
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let release_rx = Mutex::new(release_rx);
+                let nav_crls = crls.clone();
+                let nav = std::thread::spawn(move || {
+                    index.navigate_with(&nav_crls, || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                    })
+                });
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                map.as_file_mut().set_len(0).unwrap();
+                map.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+                map.write_all(&bundle_map(&[("a", vec![b_pem.as_bytes()])]))
+                    .unwrap();
+                // Check the actual publication lock nonblockingly while the native navigation
+                // hook holds its read guard. This does not depend on the writer being scheduled.
+                let blocked = selected.roots.write_blocked();
+                let rotating = manager.clone();
+                let update = std::thread::spawn(move || rotating.reload());
+                release_tx.send(()).unwrap();
+                nav.join().unwrap();
+                update.join().unwrap().unwrap();
+                assert!(
+                    blocked,
+                    "the selected-store write boundary must be blocked through crypto and signal"
+                );
+                assert_eq!(
+                    *tracked.subscribe_revoked().borrow(),
+                    revoke_old,
+                    "old-A proof must precede B publication; old-A clean verdict cannot close B"
+                );
+                assert_eq!(
+                    *selected.subscribe().borrow(),
+                    !revoke_old,
+                    "B update must independently enforce its already-loaded CRL"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_registration_foreign_crl_error_retains_leaf_for_own_revocation() {
+        use crate::tls::mock::bundle_map;
+        use crate::tls::trust_domains::TrustDomainManager;
+        let root_a = gen_ca("same-root", 1);
+        let root_b = gen_ca("same-root", 1);
+        let b_pem = root_b.1.self_signed(&root_b.0).unwrap().pem();
+        let id = Identity::from_str("spiffe://b/ns/n/sa/b").unwrap();
+        let chain = vec![signed_by(&gen_leaf(&id.to_string(), 99), &root_b)];
+        for usage in [KeyUsage::client_auth(), KeyUsage::server_auth()] {
+            let (mut crl_file, crls) = crl_manager_empty();
+            let manager =
+                TrustDomainManager::from_bundle_map(&bundle_map(&[("b", vec![b_pem.as_bytes()])]))
+                    .unwrap();
+            let selected =
+                manager.register_with_crls(id.clone(), chain.clone(), usage, Some(crls.clone()));
+            assert!(!*selected.subscribe().borrow());
+            // CRL publication races between mapped admission and native CRL registration.
+            write_crl(&mut crl_file, &crl_pem_signed(&root_a, 1, &[99]));
+            crls.load_crl().unwrap();
+            let error = verify_cert_chain(
+                &chain[0],
+                &chain[1..],
+                &selected.roots.current(),
+                UnixTime::now(),
+                usage,
+                &crls.get_crls(),
+            )
+            .err()
+            .expect("foreign same-DN signature must fail native CRL verification");
+            assert!(
+                !matches!(error, webpki::Error::CertRevoked),
+                "an unrelated issuer cannot prove B revoked"
+            );
+            let mut reg = conn_reg(chain.clone(), selected.roots.current())
+                .with_peer_roots(selected.roots.clone());
+            reg.key_usage = usage;
+            let tracked = crls.register(reg);
+            assert!(
+                !*tracked.subscribe_revoked().borrow(),
+                "unrelated CRL must preserve trusted B"
+            );
+            write_crl(&mut crl_file, &crl_pem_signed(&root_b, 2, &[99]));
+            crls.load_crl().unwrap();
+            assert!(
+                *tracked.subscribe_revoked().borrow(),
+                "B's later valid CRL must find the retained leaf"
+            );
+        }
     }
 }

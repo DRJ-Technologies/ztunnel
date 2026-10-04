@@ -267,3 +267,102 @@ pub fn generate_intermediate_ca(root_ca_key: &[u8]) -> (String, String, Vec<u8>)
     let ia_key_pem = ia_kp.serialize_pem();
     (ia_key_pem, ia_cert_pem, ia_serial.to_bytes())
 }
+
+/// A cert and crl signing CA with subject `CN=<cn>` and the given serial.
+pub fn generate_ca_material(cn: &str, serial: u64) -> (rcgen::KeyPair, rcgen::CertificateParams) {
+    use rcgen::*;
+    let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut p = CertificateParams::default();
+    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    p.serial_number = Some(SerialNumber::from(serial));
+    let now = SystemTime::now();
+    p.not_before = now.into();
+    p.not_after = (now + Duration::from_secs(3600)).into();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    p.distinguished_name = dn;
+    (kp, p)
+}
+
+/// A workload leaf (serverAuth+clientAuth, SPIFFE URI SAN) with the given serial.
+pub fn generate_leaf_material(
+    spiffe: &str,
+    serial: u64,
+) -> (rcgen::KeyPair, rcgen::CertificateParams) {
+    use rcgen::*;
+    let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut p = CertificateParams::default();
+    p.serial_number = Some(SerialNumber::from(serial));
+    let now = SystemTime::now();
+    p.not_before = now.into();
+    p.not_after = (now + Duration::from_secs(3600)).into();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "leaf");
+    p.distinguished_name = dn;
+    p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    p.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    p.subject_alt_names = vec![SanType::URI(
+        string::Ia5String::try_from(spiffe.to_string()).unwrap(),
+    )];
+    (kp, p)
+}
+
+/// Standard SPIFFE test bundle derived directly from each native CA certificate.
+pub fn bundle_map(entries: &[(&str, Vec<&[u8]>)]) -> Vec<u8> {
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
+    let mut domains = serde_json::Map::new();
+    for (domain, pems) in entries {
+        let mut keys = Vec::new();
+        for pem in pems {
+            for der in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)).map(Result::unwrap) {
+                let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+                let mut key = serde_json::json!({"use":"x509-svid", "x5c":[STANDARD.encode(&der)]});
+                match cert.public_key().parsed().unwrap() {
+                    x509_parser::public_key::PublicKey::RSA(rsa) => {
+                        key["kty"] = "RSA".into();
+                        key["n"] = URL_SAFE_NO_PAD
+                            .encode(rsa.modulus.strip_prefix(&[0]).unwrap_or(rsa.modulus))
+                            .into();
+                        key["e"] = URL_SAFE_NO_PAD
+                            .encode(rsa.exponent.strip_prefix(&[0]).unwrap_or(rsa.exponent))
+                            .into();
+                    }
+                    x509_parser::public_key::PublicKey::EC(ec) => {
+                        key["kty"] = "EC".into();
+                        key["crv"] = "P-256".into();
+                        let point = ec.data();
+                        key["x"] = URL_SAFE_NO_PAD.encode(&point[1..33]).into();
+                        key["y"] = URL_SAFE_NO_PAD.encode(&point[33..]).into();
+                    }
+                    _ => panic!("unsupported test CA"),
+                }
+                keys.push(key);
+            }
+        }
+        domains.insert((*domain).into(), serde_json::json!({"keys":keys}));
+    }
+    serde_json::to_vec(&serde_json::json!({"trust_domains":domains})).unwrap()
+}
+
+pub fn generate_workload(
+    ca: &(rcgen::KeyPair, rcgen::CertificateParams),
+    spiffe: &str,
+) -> WorkloadCertificate {
+    let leaf = generate_leaf_material(spiffe, 100);
+    let issuer = rcgen::Issuer::from_params(&ca.1, &ca.0);
+    let cert = leaf.1.signed_by(&leaf.0, &issuer).unwrap();
+    let root = ca.1.self_signed(&ca.0).unwrap().pem();
+    WorkloadCertificate::new(
+        leaf.0.serialize_pem().as_bytes(),
+        cert.pem().as_bytes(),
+        vec![root.as_bytes()],
+    )
+    .unwrap()
+}

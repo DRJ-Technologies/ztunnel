@@ -65,6 +65,23 @@ impl serde::Serialize for Identity {
     }
 }
 
+/// Canonical SPIFFE authority, without ports, userinfo, escapes or normalization.
+pub(crate) fn valid_trust_domain(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s.bytes().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'-' | b'_')
+        })
+}
+
+fn valid_spiffe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
+}
+
 impl FromStr for Identity {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -78,7 +95,12 @@ impl FromStr for Identity {
         if split.len() != 5 {
             return Err(Spiffe(s.to_string()));
         }
-        if split[1] != NAMESPACE || split[3] != SERVICE_ACCOUNT {
+        if split[1] != NAMESPACE
+            || split[3] != SERVICE_ACCOUNT
+            || !valid_trust_domain(split[0])
+            || !valid_spiffe_segment(split[2])
+            || !valid_spiffe_segment(split[4])
+        {
             return Err(Spiffe(s.to_string()));
         }
         Ok(Identity::Spiffe {
@@ -1223,14 +1245,16 @@ mod tests {
                 service_account: "sa.with.dots".into(),
             })
         );
-        assert_eq!(
-            Identity::from_str("spiffe://td/ns//sa/").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td".into(),
-                namespace: "".into(),
-                service_account: "".into()
-            })
-        );
+        for id in [
+            "spiffe://td/ns//sa/",
+            "spiffe://td/ns/ns/sa/",
+            "spiffe://td/ns//sa/sa",
+            "spiffe:///ns/ns/sa/sa",
+            "spiffe://td/ns/./sa/sa",
+            "spiffe://td/ns/ns/sa/..",
+        ] {
+            assert_matches!(Identity::from_str(id), Err(_));
+        }
         assert_matches!(Identity::from_str("td/ns/ns/sa/sa"), Err(_));
         assert_matches!(Identity::from_str("spiffe://td/ns/ns/sa"), Err(_));
         assert_matches!(Identity::from_str("spiffe://td/ns/ns/sa/sa/"), Err(_));

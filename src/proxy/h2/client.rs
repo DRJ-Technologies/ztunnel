@@ -44,6 +44,7 @@ pub struct H2ConnectClient {
     /// so they can attribute a revoked teardown as `CERT_REVOKED`.
     /// `None` when CRL enforcement is disabled.
     revoked_rx: Option<watch::Receiver<bool>>,
+    trust_domain_rx: Option<watch::Receiver<bool>>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -90,6 +91,9 @@ impl H2ConnectClient {
     }
 
     pub fn ready_to_use(&mut self) -> bool {
+        if self.trust_domain_rx.as_ref().is_some_and(|r| *r.borrow()) {
+            return false;
+        }
         let cx = &mut Context::from_waker(futures::task::noop_waker_ref());
         match self.sender.poll_ready(cx) {
             Poll::Ready(Ok(_)) => true,
@@ -108,6 +112,9 @@ impl H2ConnectClient {
         &mut self,
         req: http::Request<()>,
     ) -> Result<(crate::proxy::h2::H2Stream, Option<Baggage>), Error> {
+        if self.trust_domain_rx.as_ref().is_some_and(|r| *r.borrow()) {
+            return Err(Error::TrustDomainRemoved);
+        }
         let cur = self.stream_count.fetch_add(1, Ordering::SeqCst);
         trace!(current_streams = cur, "sending request");
         let (send, recv, baggage) = match self.internal_send(req).await {
@@ -161,6 +168,7 @@ pub async fn spawn_connection(
     driver_drain: Receiver<bool>,
     wl_key: WorkloadKey,
     revocation: Option<RevocationHandle>,
+    trust_domain: Option<crate::tls::trust_domains::TrustDomainHandle>,
 ) -> Result<H2ConnectClient, Error> {
     let mut builder = h2::client::Builder::new();
     builder
@@ -190,12 +198,13 @@ pub async fn spawn_connection(
     // state is moved into the driver task, so each stream this connection produces can attribute a
     // revoked teardown.
     let revoked_rx = revocation.as_ref().map(|r| r.subscribe_revoked());
+    let trust_domain_rx = trust_domain.as_ref().map(|h| h.subscribe());
     // spawn a task to poll the connection and drive the HTTP state
     // if we got a drain for that connection, respect it in a race
     // it is important to have a drain here, or this connection will never terminate
     tokio::spawn(
         async move {
-            drive_connection(connection, driver_drain, revocation).await;
+            drive_connection(connection, driver_drain, revocation, trust_domain).await;
         }
         .in_current_span(),
     );
@@ -206,6 +215,7 @@ pub async fn spawn_connection(
         max_allowed_streams,
         wl_key,
         revoked_rx,
+        trust_domain_rx,
     };
     Ok(c)
 }
@@ -214,6 +224,7 @@ async fn drive_connection<S, B>(
     mut conn: Connection<S, B>,
     mut driver_drain: Receiver<bool>,
     mut revocation: Option<RevocationHandle>,
+    mut trust_domain: Option<crate::tls::trust_domains::TrustDomainHandle>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
     B: Buf,
@@ -249,6 +260,9 @@ async fn drive_connection<S, B>(
                 );
             }
         }
+        _ = crate::tls::trust_domains::wait_for_removal(trust_domain.as_mut()) => {
+            debug!("terminating outbound connection: selected SPIFFE bundle removed");
+        }
         res = conn => {
             match res {
                 Err(e) => {
@@ -262,4 +276,155 @@ async fn drive_connection<S, B>(
     }
     // Signal to the ping_pong it should also stop.
     dropped.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    use crate::tls::mock::{bundle_map, generate_ca_material, generate_workload};
+    use crate::tls::trust_domains::TrustDomainManager;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn selected_bundle_removal_closes_active_native_h2_in_both_directions() {
+        for removed_domain in ["client", "server"] {
+            let ca = generate_ca_material("root", 1);
+            let pem = ca.1.self_signed(&ca.0).unwrap().pem();
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let initial = bundle_map(&[
+                ("client", vec![pem.as_bytes()]),
+                ("server", vec![pem.as_bytes()]),
+            ]);
+            file.write_all(&initial).unwrap();
+            let manager = TrustDomainManager::new(file.path().to_path_buf());
+            let server = generate_workload(&ca, "spiffe://server/ns/n/sa/server");
+            let client = generate_workload(&ca, "spiffe://client/ns/n/sa/client");
+            let server_id = server.identity().unwrap();
+            let client_id = client.identity().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tcp_client, tcp_server) =
+                tokio::join!(TcpStream::connect(addr), listener.accept());
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
+                server.server_config(Some(&manager), None).unwrap(),
+            ));
+            let accept =
+                tokio::spawn(async move { acceptor.accept(tcp_server.unwrap().0).await.unwrap() });
+            let client_tls = client
+                .outbound_connector_with_trust_domains(
+                    vec![server_id.clone()],
+                    None,
+                    Some(&manager),
+                )
+                .unwrap()
+                .connect(tcp_client.unwrap())
+                .await
+                .unwrap();
+            let server_tls = accept.await.unwrap();
+            let server_handle = server
+                .register_peer(
+                    Some(&manager),
+                    server_tls.get_ref().1,
+                    client_id.clone(),
+                    webpki::KeyUsage::client_auth(),
+                    None,
+                )
+                .unwrap();
+            let client_handle = client
+                .register_peer(
+                    Some(&manager),
+                    client_tls.get_ref().1,
+                    server_id.clone(),
+                    webpki::KeyUsage::server_auth(),
+                    None,
+                )
+                .unwrap();
+            let cfg = Arc::new(crate::test_helpers::test_config());
+            let (_drain_trigger, drain) = crate::drain::new();
+            let (_force_tx, force_rx) = watch::channel(());
+            let server_cfg = cfg.clone();
+            let serving = tokio::spawn(async move {
+                super::super::server::serve_connection(
+                    server_cfg,
+                    server_tls,
+                    drain,
+                    force_rx,
+                    None,
+                    Some(server_handle),
+                    |req| async move {
+                        let stream = req.send_response(http::Response::new(())).await.unwrap();
+                        let mut stream = super::super::TokioH2Stream::new(stream);
+                        let _ = stream.write_all(b"x").await;
+                        let mut byte = [0];
+                        let _ = stream.read(&mut byte).await;
+                    },
+                )
+                .await
+            });
+            let (_driver_tx, driver_rx) = watch::channel(false);
+            let key = WorkloadKey {
+                src_id: client_id,
+                dst_id: vec![server_id],
+                src: addr.ip(),
+                dst: addr,
+            };
+            let mut sender =
+                spawn_connection(cfg, client_tls, driver_rx, key, None, Some(client_handle))
+                    .await
+                    .unwrap();
+            let request = || {
+                http::Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri(addr.to_string())
+                    .body(())
+                    .unwrap()
+            };
+            let (stream, _) = sender.send_request(request()).await.unwrap();
+            let mut stream = super::super::TokioH2Stream::new(stream);
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, [b'x']);
+            // A new generation retaining this selected anchor must preserve an existing tunnel.
+            file.as_file_mut().set_len(0).unwrap();
+            file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&initial).unwrap();
+            manager.reload().unwrap();
+            assert!(sender.ready_to_use());
+            let (second, _) = sender.send_request(request()).await.unwrap();
+            let mut second = super::super::TokioH2Stream::new(second);
+            second.read_exact(&mut byte).await.unwrap();
+            let retained = if removed_domain == "client" {
+                "server"
+            } else {
+                "client"
+            };
+            file.as_file_mut().set_len(0).unwrap();
+            file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&bundle_map(&[(retained, vec![pem.as_bytes()])]))
+                .unwrap();
+            manager.reload().unwrap();
+            if removed_domain == "server" {
+                assert!(!sender.ready_to_use());
+                assert!(matches!(
+                    sender.send_request(request()).await,
+                    Err(Error::TrustDomainRemoved)
+                ));
+            }
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("active stream must be reset");
+            assert!(
+                read.is_err() || read.unwrap() == 0,
+                "removed peer continued serving"
+            );
+            tokio::time::timeout(Duration::from_secs(2), serving)
+                .await
+                .expect("native server driver must exit")
+                .unwrap()
+                .unwrap();
+        }
+    }
 }

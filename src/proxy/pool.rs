@@ -75,6 +75,7 @@ struct ConnSpawner {
     local_workload: Arc<LocalWorkloadInformation>,
     timeout_rx: watch::Receiver<bool>,
     crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    trust_domain_manager: Option<crate::tls::trust_domains::TrustDomainManager>,
     metrics: Arc<crate::proxy::Metrics>,
 }
 
@@ -84,7 +85,11 @@ impl ConnSpawner {
         debug!("spawning new pool conn for {}", key);
 
         let cert = self.local_workload.fetch_certificate().await?;
-        let connector = cert.outbound_connector(key.dst_id.clone(), self.crl_manager.clone())?;
+        let connector = cert.outbound_connector_with_trust_domains(
+            key.dst_id.clone(),
+            self.crl_manager.clone(),
+            self.trust_domain_manager.as_ref(),
+        )?;
         let tcp_stream = super::freebind_connect(None, key.dst, self.socket_factory.as_ref())
             .await
             .map_err(|e: io::Error| match e.kind() {
@@ -99,20 +104,27 @@ impl ConnSpawner {
             }
         })?;
         trace!("connector connected, handshaking");
-        // Enforce CRL revocation on this tunnel for its whole lifetime
+        let (_, ssl) = tls_stream.get_ref();
+        let peer_identity = crate::tls::identity(&crate::tls::certificate_from_connection(ssl))
+            .ok_or(Error::ConnectionTrackingFailed)?;
+        let trust_domain = cert.register_peer(
+            self.trust_domain_manager.as_ref(),
+            ssl,
+            peer_identity.clone(),
+            webpki::KeyUsage::server_auth(),
+            self.crl_manager.clone(),
+        )?;
         let revocation = self.crl_manager.as_ref().map(|crl_manager| {
-            let (_, ssl) = tls_stream.get_ref();
-            let peer_identity = {
-                let x509_cert = crate::tls::certificate_from_connection(ssl);
-                crate::tls::identity(&x509_cert)
-            };
-            crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
-                ssl,
-                peer_identity,
-                cert.root_store(),
-                webpki::KeyUsage::server_auth(),
-                crate::proxy::metrics::Reporter::source,
-            ))
+            crl_manager.register(
+                crate::tls::revocation::ConnRegistration::from_conn(
+                    ssl,
+                    Some(peer_identity),
+                    trust_domain.roots.current(),
+                    webpki::KeyUsage::server_auth(),
+                    crate::proxy::metrics::Reporter::source,
+                )
+                .with_peer_roots(trust_domain.roots.clone()),
+            )
         });
         let sender = h2::client::spawn_connection(
             self.cfg.clone(),
@@ -120,6 +132,7 @@ impl ConnSpawner {
             self.timeout_rx.clone(),
             key,
             revocation,
+            Some(trust_domain),
         )
         .await?;
         Ok(sender)
@@ -362,6 +375,7 @@ impl WorkloadHBONEPool {
         socket_factory: Arc<dyn SocketFactory + Send + Sync>,
         local_workload: Arc<LocalWorkloadInformation>,
         crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+        trust_domain_manager: Option<crate::tls::trust_domains::TrustDomainManager>,
         metrics: Arc<crate::proxy::Metrics>,
     ) -> WorkloadHBONEPool {
         let (timeout_tx, timeout_rx) = watch::channel(false);
@@ -374,6 +388,7 @@ impl WorkloadHBONEPool {
             local_workload,
             timeout_rx: timeout_recv.clone(),
             crl_manager,
+            trust_domain_manager,
             metrics,
         };
 
@@ -1062,6 +1077,7 @@ mod test {
             Arc::new(cfg),
             sock_fact,
             local_workload,
+            None,
             None,
             Arc::new(crate::proxy::Metrics::new(&mut Registry::default())),
         );

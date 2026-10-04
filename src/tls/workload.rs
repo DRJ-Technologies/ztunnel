@@ -25,7 +25,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{
     CertRevocationListError, ClientConfig, DigitallySignedStruct, DistinguishedName, OtherError,
-    RootCertStore, SignatureScheme,
+    SignatureScheme,
 };
 use std::future::Future;
 use std::io;
@@ -34,11 +34,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use webpki::{CertRevocationList, KeyUsage};
 
-use crate::strng::Strng;
 use crate::tls;
 use tokio::net::TcpStream;
 use tokio_rustls::client;
-use tracing::{debug, trace};
+use tracing::trace;
 
 #[derive(Clone, Debug)]
 pub struct InboundAcceptor<F: ServerCertProvider> {
@@ -53,92 +52,98 @@ impl<F: ServerCertProvider> InboundAcceptor<F> {
 
 #[derive(Debug)]
 pub(super) struct TrustDomainVerifier {
-    base: Arc<dyn ClientCertVerifier>,
-    trust_domains: Vec<Strng>,
+    manager: tls::trust_domains::TrustDomainManager,
+    crl_manager: Option<Arc<tls::crl::CrlManager>>,
 }
 
 impl TrustDomainVerifier {
-    pub fn new(base: Arc<dyn ClientCertVerifier>, trust_domains: Vec<Strng>) -> Arc<Self> {
+    pub fn new(
+        manager: tls::trust_domains::TrustDomainManager,
+        crl_manager: Option<Arc<tls::crl::CrlManager>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            base,
-            trust_domains,
+            manager,
+            crl_manager,
         })
-    }
-
-    fn verify_trust_domain(&self, client_cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
-        use x509_parser::prelude::*;
-        if self.trust_domains.is_empty() {
-            // No need to verify
-            return Ok(());
-        }
-        let (_, c) = X509Certificate::from_der(client_cert).map_err(|_e| {
-            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-        })?;
-        let ids = tls::certificate::identities(&c).map_err(|_e| {
-            rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            )
-        })?;
-        trace!(
-            "verifying client identities {ids:?} against trust domains {:?}",
-            self.trust_domains
-        );
-        ids.iter()
-            .find(|id| match id {
-                Identity::Spiffe { trust_domain, .. } => self.trust_domains.contains(trust_domain),
-            })
-            .ok_or_else(|| {
-                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
-                    rustls::OtherError(Arc::new(TlsError::SanTrustDomainError(
-                        self.trust_domains.clone(),
-                        ids.clone(),
-                    ))),
-                ))
-            })
-            .map(|_| ())
     }
 }
 
-// Implement our custom ClientCertVerifier logic. We only want to add an extra check, but
-// need a decent amount of boilerplate to do so.
+fn peer_identity(cert: &CertificateDer<'_>) -> Result<Identity, rustls::Error> {
+    let (remaining, cert) = x509_parser::parse_x509_certificate(cert)
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    if !remaining.is_empty() {
+        return Err(rustls::CertificateError::BadEncoding.into());
+    }
+    tls::certificate::identities(&cert)
+        .map_err(|_| {
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| rustls::CertificateError::ApplicationVerificationFailure.into())
+}
+
 impl ClientCertVerifier for TrustDomainVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        self.base.root_hint_subjects()
+        &[]
     }
-
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let res = self
-            .base
-            .verify_client_cert(end_entity, intermediates, now)?;
-        self.verify_trust_domain(end_entity)?;
-        Ok(res)
+        let peer = peer_identity(end_entity)?;
+        let (generation, roots) = self.manager.selected(&peer)?;
+        let crls = self
+            .crl_manager
+            .as_deref()
+            .map(|m| m.get_crls())
+            .unwrap_or_default();
+        tls::revocation::verify_cert_chain(
+            end_entity,
+            intermediates,
+            &roots,
+            now,
+            KeyUsage::client_auth(),
+            &crls,
+        )
+        .map_err(webpki_error_to_rustls)?;
+        self.manager.check_generation(generation)?;
+        Ok(ClientCertVerified::assertion())
     }
-
     fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.base.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
     }
-
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.base.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
     }
-
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.base.supported_verify_schemes()
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -184,7 +189,7 @@ impl OutboundConnector {
 
 #[derive(Debug)]
 pub struct IdentityVerifier {
-    pub(super) roots: Arc<RootCertStore>,
+    pub(super) manager: tls::trust_domains::TrustDomainManager,
     pub(super) identity: Vec<Identity>,
     pub(super) crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
 }
@@ -227,35 +232,6 @@ fn webpki_error_to_rustls(error: webpki::Error) -> rustls::Error {
             CertificateError::InvalidPurpose.into()
         }
         e => CertificateError::Other(OtherError(std::sync::Arc::new(e))).into(),
-    }
-}
-
-impl IdentityVerifier {
-    fn verify_full_san(&self, server_cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
-        use x509_parser::prelude::*;
-        let (_, c) = X509Certificate::from_der(server_cert).map_err(|_e| {
-            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-        })?;
-        let id = tls::certificate::identities(&c).map_err(|_e| {
-            rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            )
-        })?;
-        trace!(
-            "verifying server identities {id:?} against {:?}",
-            self.identity
-        );
-        for ident in id.iter() {
-            if let Some(_i) = self.identity.iter().find(|id| id == &ident) {
-                return Ok(());
-            }
-        }
-        debug!("identity mismatch {id:?} != {:?}", self.identity);
-        Err(rustls::Error::InvalidCertificate(
-            rustls::CertificateError::Other(rustls::OtherError(Arc::new(DebugAsDisplay(
-                TlsError::SanError(self.identity.clone(), id),
-            )))),
-        ))
     }
 }
 
@@ -302,11 +278,13 @@ impl ServerCertVerifier for IdentityVerifier {
             .map(|mgr| mgr.get_crls())
             .unwrap_or_default();
 
-        // Shared cert chain + CRL-revocation verification
+        let peer = peer_identity(end_entity)?;
+        let (generation, roots) = self.manager.selected(&peer)?;
+        // The peer domain selects the store before native chain and purpose verification.
         crate::tls::revocation::verify_cert_chain(
             end_entity,
             intermediates,
-            &self.roots,
+            &roots,
             now,
             KeyUsage::server_auth(),
             &crls,
@@ -317,7 +295,14 @@ impl ServerCertVerifier for IdentityVerifier {
             trace!("Unvalidated OCSP response: {ocsp_response:?}");
         }
 
-        self.verify_full_san(end_entity)?;
+        if !self.identity.contains(&peer) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(DebugAsDisplay(
+                    TlsError::SanError(self.identity.clone(), vec![peer]),
+                )))),
+            ));
+        }
+        self.manager.check_generation(generation)?;
 
         Ok(ServerCertVerified::assertion())
     }

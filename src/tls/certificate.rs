@@ -22,7 +22,6 @@ use std::{cmp, iter};
 use rustls::client::Resumption;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, CommonState, RootCertStore, ServerConfig};
 use rustls_pemfile::Item;
 use std::io::Cursor;
@@ -89,26 +88,22 @@ pub fn identities(cert: &X509Certificate) -> Result<Vec<Identity>, Error> {
         .subject_alternative_name()?
         .map(|x| &x.value.general_names);
 
-    if let Some(names) = names {
-        return Ok(names
-            .iter()
-            .filter_map(|n| {
-                let id = match n {
-                    GeneralName::URI(uri) => Identity::from_str(uri),
-                    _ => return None,
-                };
-
-                match id {
-                    Ok(id) => Some(id),
-                    Err(err) => {
-                        warn!("SAN {n} could not be parsed: {err}");
-                        None
-                    }
-                }
-            })
-            .collect());
+    let uris: Vec<_> = names
+        .into_iter()
+        .flatten()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some(*uri),
+            _ => None,
+        })
+        .collect();
+    if uris.len() != 1 {
+        return Err(Error::CertificateParseError(
+            "expected exactly one URI SAN".into(),
+        ));
     }
-    Ok(Vec::default())
+    let identity =
+        Identity::from_str(uris[0]).map_err(|e| Error::CertificateParseError(e.to_string()))?;
+    Ok(vec![identity])
 }
 
 impl Certificate {
@@ -124,21 +119,7 @@ impl Certificate {
     }
 
     pub fn identity(&self) -> Option<Identity> {
-        self.parsed()
-            .subject_alternative_name()
-            .ok()
-            .flatten()
-            .and_then(|ext| {
-                ext.value
-                    .general_names
-                    .iter()
-                    .filter_map(|n| match n {
-                        x509_parser::extensions::GeneralName::URI(uri) => Some(uri),
-                        _ => None,
-                    })
-                    .next()
-            })
-            .and_then(|san| Identity::from_str(san).ok())
+        identities(&self.parsed()).ok()?.into_iter().next()
     }
 
     #[cfg(test)]
@@ -318,48 +299,9 @@ impl WorkloadCertificate {
         trust_domains: Option<&crate::tls::trust_domains::TrustDomainManager>,
         crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
     ) -> Result<ServerConfig, Error> {
-        // Accept the trust domain our own certificate is in, plus the ones the mesh is configured to
-        // accept. A server config is built for each connection, so a snapshot of the current set is
-        // what this connection is verified against.
-        let trust_domains = match self.cert.identity() {
-            // Configured to accept any trust domain: skip the check, as Envoy does without SAN matchers.
-            Some(_) if trust_domains.is_some_and(|mgr| mgr.accepts_any()) => Vec::new(),
-            Some(Identity::Spiffe { trust_domain, .. }) => {
-                let mut accepted = vec![trust_domain];
-                if let Some(mgr) = trust_domains {
-                    for td in mgr.accepted().iter() {
-                        if !accepted.contains(td) {
-                            accepted.push(td.clone());
-                        }
-                    }
-                }
-                accepted
-            }
-            // Without an identity of our own there is nothing to compare a peer against.
-            None => Vec::new(),
-        };
-
-        // build the base client cert verifier with optional CRL support
-        let mut builder = WebPkiClientVerifier::builder_with_provider(
-            self.root_store.clone(),
-            crate::tls::lib::provider(),
-        );
-
-        // add CRLs if available
-        if let Some(ref mgr) = crl_manager {
-            let crls = mgr.get_crl_ders();
-            if !crls.is_empty() {
-                builder = builder
-                    .with_crls(crls.iter().cloned())
-                    .allow_unknown_revocation_status(); // fail-open for unknown status
-            }
-        }
-
-        // TODO: check if our own certificate is revoked in the CRL and log warning
-        let raw_client_cert_verifier = builder.build()?;
-
+        let manager = self.peer_bundle_manager(trust_domains)?;
         let client_cert_verifier =
-            crate::tls::workload::TrustDomainVerifier::new(raw_client_cert_verifier, trust_domains);
+            crate::tls::workload::TrustDomainVerifier::new(manager, crl_manager);
         let mut sc = ServerConfig::builder_with_provider(crate::tls::lib::provider())
             .with_protocol_versions(tls::tls_versions())
             .expect("server config must be valid")
@@ -369,7 +311,22 @@ impl WorkloadCertificate {
                 self.private_key.clone_key(),
             )?;
         sc.alpn_protocols = vec![b"h2".into()];
+        // Every connection must run current domain/chain verification; tickets and caches must not
+        // restore authentication from a removed bundle generation.
+        sc.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        sc.send_tls13_tickets = 0;
         Ok(sc)
+    }
+
+    pub(crate) fn peer_bundle_manager(
+        &self,
+        configured: Option<&crate::tls::trust_domains::TrustDomainManager>,
+    ) -> Result<crate::tls::trust_domains::TrustDomainManager, rustls::Error> {
+        let manager = configured.cloned().unwrap_or_else(|| {
+            crate::tls::trust_domains::TrustDomainManager::new(Default::default())
+        });
+        manager.configure_local(self)?;
+        Ok(manager)
     }
 
     pub fn client_config(
@@ -377,9 +334,17 @@ impl WorkloadCertificate {
         identity: Vec<Identity>,
         crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
     ) -> Result<ClientConfig, rustls::Error> {
-        let roots = self.root_store.clone();
+        self.client_config_with_trust_domains(identity, crl_manager, None)
+    }
+
+    pub fn client_config_with_trust_domains(
+        &self,
+        identity: Vec<Identity>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+        trust_domains: Option<&crate::tls::trust_domains::TrustDomainManager>,
+    ) -> Result<ClientConfig, rustls::Error> {
         let verifier = IdentityVerifier {
-            roots,
+            manager: self.peer_bundle_manager(trust_domains)?,
             identity,
             crl_manager,
         };
@@ -403,10 +368,46 @@ impl WorkloadCertificate {
         identity: Vec<Identity>,
         crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
     ) -> Result<OutboundConnector, Error> {
-        let cc = self.client_config(identity, crl_manager)?;
+        self.outbound_connector_with_trust_domains(identity, crl_manager, None)
+    }
+
+    pub fn outbound_connector_with_trust_domains(
+        &self,
+        identity: Vec<Identity>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+        trust_domains: Option<&crate::tls::trust_domains::TrustDomainManager>,
+    ) -> Result<OutboundConnector, Error> {
+        let cc = self.client_config_with_trust_domains(identity, crl_manager, trust_domains)?;
         Ok(OutboundConnector {
             client_config: Arc::new(cc),
         })
+    }
+
+    pub(crate) fn register_peer(
+        &self,
+        manager: Option<&crate::tls::trust_domains::TrustDomainManager>,
+        ssl: &CommonState,
+        peer: Identity,
+        usage: webpki::KeyUsage,
+        crls: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> Result<crate::tls::trust_domains::TrustDomainHandle, Error> {
+        let manager = self.peer_bundle_manager(manager)?;
+        let chain = ssl
+            .peer_certificates()
+            .ok_or_else(|| {
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
+                )
+            })?
+            .to_vec();
+        let handle = manager.register_with_crls(peer, chain, usage, crls);
+        if *handle.subscribe().borrow() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            )
+            .into());
+        }
+        Ok(handle)
     }
 
     pub fn dump_chain(&self) -> Bytes {
@@ -516,7 +517,11 @@ mod test {
             WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), vec![&joined]).unwrap();
 
         // Do a simple handshake between them; we should be able to accept the trusted root
-        let server = cert1.server_config(None, None).unwrap();
+        let manager = crate::tls::trust_domains::TrustDomainManager::from_bundle_map(
+            &crate::tls::mock::bundle_map(&[("td", vec![TEST_ROOT, TEST_ROOT2])]),
+        )
+        .unwrap();
+        let server = cert1.server_config(Some(&manager), None).unwrap();
         let tls = TlsAcceptor::from(Arc::new(server));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -527,7 +532,9 @@ mod test {
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
-        let client = cert2.outbound_connector(vec![id], None).unwrap();
+        let client = cert2
+            .outbound_connector_with_trust_domains(vec![id], None, Some(&manager))
+            .unwrap();
         let mut tls = client.connect(stream).await.unwrap();
 
         let _ = tls.write(b"hi").await.unwrap();
@@ -685,117 +692,317 @@ mod test {
         assert!(io_error_is_cert_revoked(&err));
     }
 
-    #[tokio::test]
-    async fn configured_trust_domains_do_not_trust_another_root() {
-        helpers::initialize_telemetry();
-        let server_id = Identity::from_str("spiffe://td/ns/n/sa/a").unwrap();
-        let client_id = Identity::from_str("spiffe://other-td/ns/n/sa/b").unwrap();
-        let certs = |id: &Identity, key: &[u8], roots: Vec<&[u8]>| {
-            let (key, cert) = crate::tls::mock::generate_test_certs_with_root(
-                &TestIdentity::Identity(id.clone()),
-                SystemTime::now(),
-                SystemTime::now() + Duration::from_secs(60),
-                None,
-                key,
-            );
-            WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), roots).unwrap()
-        };
-        let server_cert = certs(&server_id, TEST_ROOT_KEY, vec![TEST_ROOT]);
-        // The client trusts the server's root, but its own certificate chains to a
-        // different root which the server has never been given.
-        let mut client_roots = TEST_ROOT.to_vec();
-        client_roots.push(b'\n');
-        client_roots.extend(TEST_ROOT2);
-        let client_cert = certs(&client_id, TEST_ROOT2_KEY, vec![&client_roots]);
-        for accepted in ["other-td", "*"] {
-            let mgr =
-                crate::tls::trust_domains::TrustDomainManager::from_trust_domains(&[accepted]);
-            let server = server_cert.server_config(Some(&mgr), None).unwrap();
-            let tls = TlsAcceptor::from(Arc::new(server));
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                tls.accept(stream).await.unwrap_err()
-            });
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let client = client_cert
-                .outbound_connector(vec![server_id.clone()], None)
-                .unwrap();
-            if let Ok(mut tls) = client.connect(stream).await {
-                let _ = tls.write(b"hi").await;
-                let mut buf = [0u8; 4];
-                assert!(tls.read_exact(&mut buf).await.is_err());
+    #[test]
+    fn mapped_three_independent_roots_both_tls_roles() {
+        use crate::tls::mock::{bundle_map, generate_ca_material, generate_workload};
+        use crate::tls::trust_domains::TrustDomainManager;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+        use rustls::server::danger::ClientCertVerifier;
+        let domains = ["prod.example", "nonprod.example", "build.example"];
+        let cas = domains.map(|_| generate_ca_material("same-subject", 1));
+        let pems: Vec<_> = cas
+            .iter()
+            .map(|c| c.1.self_signed(&c.0).unwrap().pem())
+            .collect();
+        let entries: Vec<_> = domains
+            .iter()
+            .zip(&pems)
+            .map(|(d, p)| (*d, vec![p.as_bytes()]))
+            .collect();
+        let manager = TrustDomainManager::from_bundle_map(&bundle_map(&entries)).unwrap();
+        let inbound = crate::tls::workload::TrustDomainVerifier::new(manager.clone(), None);
+        for (domain_index, domain) in domains.iter().enumerate() {
+            for (root_index, ca) in cas.iter().enumerate() {
+                let spiffe = format!("spiffe://{domain}/ns/n/sa/a");
+                let cert = generate_workload(ca, &spiffe);
+                let expected = Identity::from_str(&spiffe).unwrap();
+                let outbound = crate::tls::IdentityVerifier {
+                    manager: manager.clone(),
+                    identity: vec![expected],
+                    crl_manager: None,
+                };
+                let inbound_ok = inbound
+                    .verify_client_cert(&cert.cert.der, &[], UnixTime::now())
+                    .is_ok();
+                let outbound_ok = outbound
+                    .verify_server_cert(
+                        &cert.cert.der,
+                        &[],
+                        &ServerName::IpAddress(
+                            "127.0.0.1".parse::<std::net::IpAddr>().unwrap().into(),
+                        ),
+                        &[],
+                        UnixTime::now(),
+                    )
+                    .is_ok();
+                assert_eq!(
+                    inbound_ok,
+                    domain_index == root_index,
+                    "inbound {domain} root {root_index}"
+                );
+                assert_eq!(
+                    outbound_ok,
+                    domain_index == root_index,
+                    "outbound {domain} root {root_index}"
+                );
             }
-            let err = server.await.unwrap();
+        }
+        let shared = TrustDomainManager::from_bundle_map(&bundle_map(&[
+            (domains[0], vec![pems[0].as_bytes()]),
+            (domains[1], vec![pems[0].as_bytes()]),
+        ]))
+        .unwrap();
+        let inbound = crate::tls::workload::TrustDomainVerifier::new(shared.clone(), None);
+        for domain in domains {
+            let spiffe = format!("spiffe://{domain}/ns/n/sa/a");
+            let cert = generate_workload(&cas[0], &spiffe);
+            let outbound = crate::tls::IdentityVerifier {
+                manager: shared.clone(),
+                identity: vec![Identity::from_str(&spiffe).unwrap()],
+                crl_manager: None,
+            };
+            assert_eq!(
+                inbound
+                    .verify_client_cert(&cert.cert.der, &[], UnixTime::now())
+                    .is_ok(),
+                domain != domains[2]
+            );
+            assert_eq!(
+                outbound
+                    .verify_server_cert(
+                        &cert.cert.der,
+                        &[],
+                        &ServerName::IpAddress(
+                            "127.0.0.1".parse::<std::net::IpAddr>().unwrap().into()
+                        ),
+                        &[],
+                        UnixTime::now()
+                    )
+                    .is_ok(),
+                domain != domains[2]
+            );
+        }
+    }
+    #[test]
+    fn strict_uri_purpose_time_signature_and_exact_principal() {
+        use crate::tls::mock::{bundle_map, generate_ca_material, generate_leaf_material};
+        use crate::tls::trust_domains::TrustDomainManager;
+        use rcgen::*;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+        use rustls::server::danger::ClientCertVerifier;
+        let ca = generate_ca_material("root", 1);
+        let pem = ca.1.self_signed(&ca.0).unwrap().pem();
+        let manager =
+            TrustDomainManager::from_bundle_map(&bundle_map(&[("td", vec![pem.as_bytes()])]))
+                .unwrap();
+        let expected = Identity::from_str("spiffe://td/ns/n/sa/a").unwrap();
+        let inbound = crate::tls::workload::TrustDomainVerifier::new(manager.clone(), None);
+        let outbound = crate::tls::IdentityVerifier {
+            manager,
+            identity: vec![expected],
+            crl_manager: None,
+        };
+        let name = ServerName::IpAddress("127.0.0.1".parse::<std::net::IpAddr>().unwrap().into());
+        for (uris, dns, valid) in [
+            (vec![], false, false),
+            (vec![], true, false),
+            (vec!["spiffe://td/ns/n/sa/a"], true, true),
+            (
+                vec!["spiffe://td/ns/n/sa/a", "spiffe://td/ns/n/sa/a"],
+                false,
+                false,
+            ),
+            (
+                vec!["spiffe://td/ns/n/sa/a", "spiffe://other/ns/n/sa/b"],
+                false,
+                false,
+            ),
+            (vec!["spiffe://td/ns/n/sa/a", "not-spiffe"], false, false),
+            (vec!["spiffe://td"], false, false),
+            (vec!["spiffe://td/"], false, false),
+            (vec!["spiffe://TD/ns/n/sa/a"], false, false),
+            (vec!["spiffe://td:443/ns/n/sa/a"], false, false),
+            (vec!["spiffe://user@td/ns/n/sa/a"], false, false),
+            (vec!["spiffe://td/ns//sa/a"], false, false),
+            (vec!["spiffe://td/ns/../sa/a"], false, false),
+            (vec!["spiffe://td/ns/n/sa/a?x"], false, false),
+            (vec!["spiffe://td/ns/n/sa/a#x"], false, false),
+            (vec!["spiffe://td/ns/n/sa/%61"], false, false),
+            (vec!["spiffe://td/ns/n/sa/a\0"], false, false),
+        ] {
+            let leaf = generate_leaf_material("spiffe://td/ns/n/sa/a", 100);
+            let mut p = leaf.1;
+            p.subject_alt_names = uris
+                .iter()
+                .map(|u| SanType::URI(string::Ia5String::try_from((*u).to_string()).unwrap()))
+                .collect();
+            if dns {
+                p.subject_alt_names
+                    .push(SanType::DnsName("ordinary.example".try_into().unwrap()));
+            }
+            let cert = p
+                .signed_by(&leaf.0, &Issuer::from_params(&ca.1, &ca.0))
+                .unwrap();
+            assert_eq!(
+                inbound
+                    .verify_client_cert(cert.der(), &[], UnixTime::now())
+                    .is_ok(),
+                valid,
+                "inbound {uris:?}"
+            );
+            assert_eq!(
+                outbound
+                    .verify_server_cert(cert.der(), &[], &name, &[], UnixTime::now())
+                    .is_ok(),
+                valid,
+                "outbound {uris:?}"
+            );
+        }
+        for (client, server) in [(true, false), (false, true)] {
+            let leaf = generate_leaf_material("spiffe://td/ns/n/sa/a", 100);
+            let mut p = leaf.1;
+            p.extended_key_usages = vec![if client {
+                ExtendedKeyUsagePurpose::ClientAuth
+            } else {
+                ExtendedKeyUsagePurpose::ServerAuth
+            }];
+            let cert = p
+                .signed_by(&leaf.0, &Issuer::from_params(&ca.1, &ca.0))
+                .unwrap();
+            assert_eq!(
+                inbound
+                    .verify_client_cert(cert.der(), &[], UnixTime::now())
+                    .is_ok(),
+                client
+            );
+            assert_eq!(
+                outbound
+                    .verify_server_cert(cert.der(), &[], &name, &[], UnixTime::now())
+                    .is_ok(),
+                server
+            );
+        }
+        for negative in [
+            "expired",
+            "future",
+            "ca-leaf",
+            "bad-signature",
+            "wrong-principal",
+        ] {
+            let leaf = generate_leaf_material("spiffe://td/ns/n/sa/a", 100);
+            let mut p = leaf.1;
+            match negative {
+                "expired" => {
+                    p.not_before = (SystemTime::now() - Duration::from_secs(120)).into();
+                    p.not_after = (SystemTime::now() - Duration::from_secs(60)).into();
+                }
+                "future" => p.not_before = (SystemTime::now() + Duration::from_secs(60)).into(),
+                "ca-leaf" => {
+                    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                    p.key_usages.push(KeyUsagePurpose::KeyCertSign);
+                }
+                "wrong-principal" => {
+                    p.subject_alt_names = vec![SanType::URI(
+                        "spiffe://td/ns/n/sa/wrong".try_into().unwrap(),
+                    )]
+                }
+                _ => {}
+            }
+            let cert = p
+                .signed_by(&leaf.0, &Issuer::from_params(&ca.1, &ca.0))
+                .unwrap();
+            let mut der = cert.der().to_vec();
+            if negative == "bad-signature" {
+                *der.last_mut().unwrap() ^= 1;
+            }
+            let der = rustls::pki_types::CertificateDer::from(der);
+            assert_eq!(
+                inbound
+                    .verify_client_cert(&der, &[], UnixTime::now())
+                    .is_ok(),
+                negative == "wrong-principal",
+                "inbound {negative}"
+            );
             assert!(
-                matches!(
-                    err.get_ref()
-                        .and_then(|e| e.downcast_ref::<rustls::Error>()),
-                    Some(rustls::Error::InvalidCertificate(
-                        // The two test roots share an issuer name but have different
-                        // keys, so the untrusted signer fails signature validation.
-                        rustls::CertificateError::BadSignature
-                    ))
-                ),
-                "accepted domain {accepted} must not add a trusted root: {err}"
+                outbound
+                    .verify_server_cert(&der, &[], &name, &[], UnixTime::now())
+                    .is_err(),
+                "outbound {negative}"
             );
         }
     }
 
     #[tokio::test]
-    async fn configured_trust_domains() {
-        helpers::initialize_telemetry();
-        let server_id = Identity::from_str("spiffe://td/ns/n/sa/a").unwrap();
-        let client_id = Identity::from_str("spiffe://other-td/ns/n/sa/b").unwrap();
-
-        let certs = |id: &Identity| {
-            let (key, cert) = crate::tls::mock::generate_test_certs_with_root(
-                &TestIdentity::Identity(id.clone()),
-                SystemTime::now(),
-                SystemTime::now() + Duration::from_secs(60),
+    async fn mapped_live_tls_and_server_resumption_cannot_restore_removed_roots() {
+        use crate::tls::mock::{bundle_map, generate_ca_material, generate_workload};
+        use crate::tls::trust_domains::TrustDomainManager;
+        let ca = generate_ca_material("root", 1);
+        let pem = ca.1.self_signed(&ca.0).unwrap().pem();
+        let mut map = NamedTempFile::new().unwrap();
+        map.write_all(&bundle_map(&[
+            ("server", vec![pem.as_bytes()]),
+            ("client", vec![pem.as_bytes()]),
+        ]))
+        .unwrap();
+        let manager = TrustDomainManager::new(map.path().to_path_buf());
+        let server = generate_workload(&ca, "spiffe://server/ns/n/sa/server");
+        let client = generate_workload(&ca, "spiffe://client/ns/n/sa/client");
+        let sc = Arc::new(server.server_config(Some(&manager), None).unwrap());
+        assert_eq!(sc.send_tls13_tickets, 0);
+        assert!(!sc.session_storage.can_cache());
+        let mut cc = client
+            .client_config_with_trust_domains(
+                vec![server.identity().unwrap()],
                 None,
-                TEST_ROOT_KEY,
-            );
-            WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), vec![TEST_ROOT]).unwrap()
+                Some(&manager),
+            )
+            .unwrap();
+        cc.resumption = rustls::client::Resumption::in_memory_sessions(128);
+        let connector = crate::tls::OutboundConnector {
+            client_config: Arc::new(cc),
         };
-        let server_cert = certs(&server_id);
-        let client_cert = certs(&client_id);
-
-        // A client from another trust domain is rejected unless we are told to accept it.
-        for (trust_domains, want_ok) in [
-            (None, false),
-            (Some(vec![]), false),
-            (Some(vec!["unrelated-td"]), false),
-            (Some(vec!["other-td"]), true),
-            (Some(vec!["*"]), true),
-        ] {
-            let mgr = trust_domains
-                .as_deref()
-                .map(crate::tls::trust_domains::TrustDomainManager::from_trust_domains);
-            let server = server_cert.server_config(mgr.as_ref(), None).unwrap();
-            let tls = TlsAcceptor::from(Arc::new(server));
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::task::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                if let Ok(mut tls) = tls.accept(stream).await {
-                    let _ = tls.write(b"serv").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        for round in 0..3 {
+            if round == 2 {
+                map.as_file_mut().set_len(0).unwrap();
+                use std::io::{Seek, SeekFrom};
+                map.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+                map.write_all(&bundle_map(&[])).unwrap();
+                manager.reload().unwrap();
+            }
+            let acceptor = TlsAcceptor::from(sc.clone());
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let (tcp_client, tcp_server) =
+                tokio::join!(TcpStream::connect(addr), listener.accept());
+            let accepted = tokio::spawn(async move {
+                match acceptor.accept(tcp_server.unwrap().0).await {
+                    Ok(mut tls) => {
+                        let kind = tls.get_ref().1.handshake_kind();
+                        let _ = tls.write_all(b"x").await;
+                        let _ = done_tx.send(kind);
+                        true
+                    }
+                    Err(_) => false,
                 }
             });
-
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let client = client_cert
-                .outbound_connector(vec![server_id.clone()], None)
-                .unwrap();
-            let got_ok = match client.connect(stream).await {
-                Ok(mut tls) => {
-                    let mut buf = [0u8; 4];
-                    tls.write(b"hi").await.is_ok() && tls.read_exact(&mut buf).await.is_ok()
-                }
-                Err(_) => false,
-            };
-            assert_eq!(got_ok, want_ok, "trust domains {trust_domains:?}");
+            let tls = connector.clone().connect(tcp_client.unwrap()).await;
+            if round < 2 {
+                let mut tls = tls.unwrap();
+                let mut byte = [0];
+                tls.read_exact(&mut byte).await.unwrap();
+                assert_eq!(
+                    tls.get_ref().1.handshake_kind(),
+                    Some(rustls::HandshakeKind::Full)
+                );
+                assert_eq!(done_rx.await.unwrap(), Some(rustls::HandshakeKind::Full));
+                assert!(accepted.await.unwrap());
+            } else {
+                assert!(tls.is_err());
+                assert!(!accepted.await.unwrap());
+            }
         }
     }
 }
