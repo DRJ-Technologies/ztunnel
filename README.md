@@ -21,16 +21,21 @@ The details of architecture is [here](./ARCHITECTURE.md).
 
 ### Trust domains and certificate roots
 
-`TRUST_DOMAINS_PATH` reloads the accepted peer domains published by istiod. It
-changes domain validation, not the certificate roots ztunnel trusts. Explicit
-`caCertificates[].trustDomains` can therefore admit another domain only when its
-peer certificate chains to an already trusted root. This does not add PCDS or
-distribution of the additional roots from `ISTIO_MULTIROOT_MESH`.
-Native CA responses can already supply concatenated root bundles; this backport
-does not change their contents or delivery. Keep separate
-production, nonproduction and build root boundaries; domain acceptance alone
-cannot bridge them. Deployments using this backport should leave
-`trustDomainAliases` unused and `PILOT_SKIP_VALIDATE_TRUST_DOMAIN` false.
+`SPIFFE_BUNDLE_MAP_PATH` selects a standard SPIFFE bundle map published by
+istiod. Each peer's single canonical SPIFFE URI selects its domain's root store
+for both TLS roles. `TRUST_DOMAINS_PATH` remains a compatibility setting and
+grants no authority. Mount the map's directory so atomic projections can reload.
+
+An authoritative empty map or removed domain denies that domain, including the
+local domain. Invalid or unreadable mapped input fails closed and closes affected
+connections. Before the first map is available, only local workload roots that
+verify ztunnel's own SVID can supply local-domain fallback authority.
+
+CRLs continue to use the existing separate input and native policy. Missing
+issuer status is allowed and CRL expiry is ignored; bundle distribution does not
+supply complete CRL coverage. Connection rechecks use each leaf's current
+selected store. Deployments should leave `trustDomainAliases` unused and
+`PILOT_SKIP_VALIDATE_TRUST_DOMAIN` false.
 
 ## Building
 
